@@ -7,6 +7,7 @@ Endpoints:
     POST /ask         -> Ask a question, auto-detects single vs multi-part
     POST /ask/stream  -> Same, but streamed with visible stages
     POST /ask/complex -> Force-split a question into sub-tasks
+    POST /ask/image   -> Ask a question about an image (base64)
     POST /reset       -> Clear conversation memory
 
 Run with:
@@ -28,6 +29,7 @@ from router import (
     break_into_tasks,
     run_sequential_tasks,
     clear_history,
+    ask_image,
     AVAILABLE_MODELS,
 )
 
@@ -49,12 +51,24 @@ class Question(BaseModel):
     query: str = Field(..., min_length=1, description="The user's question")
 
 
+class ImageQuestion(BaseModel):
+    query: str  = Field(..., min_length=1, description="The question about the image")
+    image_b64: str = Field(
+        ...,
+        description=(
+            "Raw base64-encoded image (PNG or JPEG). "
+            "Do NOT include a data-URI prefix like 'data:image/png;base64,'. "
+            "Just the plain base64 string."
+        ),
+    )
+
+
 @app.get("/")
 def home():
     return {
         "status": "online",
         "models": AVAILABLE_MODELS,
-        "endpoints": ["/ask", "/ask/stream", "/ask/complex", "/reset", "/health", "/docs"],
+        "endpoints": ["/ask", "/ask/stream", "/ask/complex", "/ask/image", "/reset", "/health", "/docs"],
     }
 
 
@@ -168,48 +182,56 @@ def ask_stream(q: Question):
     def generate():
         start = time.time()
 
-        yield json.dumps({"type": "stage", "label": "understanding", "detail": "Reading your question..."}) + "\n"
-        info = classify_question(q.query)
+        try:
+            yield json.dumps({"type": "stage", "label": "understanding", "detail": "Reading your question..."}) + "\n"
+            info = classify_question(q.query)
 
-        if info["is_multi_part"]:
-            yield json.dumps({"type": "stage", "label": "planning", "detail": "Multi-part request detected, breaking it down..."}) + "\n"
-            tasks = break_into_tasks(q.query)
-            yield json.dumps({
-                "type": "plan",
-                "sub_tasks": [{"label": t["label"], "model": t["model"], "category": t["category"]} for t in tasks],
-            }) + "\n"
+            if info["is_multi_part"]:
+                yield json.dumps({"type": "stage", "label": "planning", "detail": "Multi-part request detected, breaking it down..."}) + "\n"
+                tasks = break_into_tasks(q.query)
+                yield json.dumps({
+                    "type": "plan",
+                    "sub_tasks": [{"label": t["label"], "model": t["model"], "category": t["category"]} for t in tasks],
+                }) + "\n"
 
-            for i, task in enumerate(tasks, 1):
+                for i, task in enumerate(tasks, 1):
+                    yield json.dumps({
+                        "type": "stage",
+                        "label": "working",
+                        "detail": f"Sub-task {i}/{len(tasks)}: {task['label']} -> {task['model']}",
+                    }) + "\n"
+                    for token in stream_answer(task["model"], task["task"]):
+                        yield json.dumps({"type": "token", "task_number": i, "content": token}) + "\n"
+                    yield json.dumps({"type": "task_done", "task_number": i}) + "\n"
+
+                yield json.dumps({"type": "done", "time_seconds": round(time.time() - start, 2)}) + "\n"
+
+            else:
+                model = info["model"]
                 yield json.dumps({
                     "type": "stage",
-                    "label": "working",
-                    "detail": f"Sub-task {i}/{len(tasks)}: {task['label']} -> {task['model']}",
+                    "label": "routing",
+                    "detail": f"Routing to {model} ({info['reason']})",
+                    "category": info["category"],
                 }) + "\n"
-                for token in stream_answer(task["model"], task["task"]):
-                    yield json.dumps({"type": "token", "task_number": i, "content": token}) + "\n"
-                yield json.dumps({"type": "task_done", "task_number": i}) + "\n"
+                yield json.dumps({"type": "stage", "label": "generating", "detail": "Writing the answer..."}) + "\n"
 
-            yield json.dumps({"type": "done", "time_seconds": round(time.time() - start, 2)}) + "\n"
+                token_count = 0
+                for token in stream_answer(model, q.query):
+                    token_count += 1
+                    yield json.dumps({"type": "token", "content": token}) + "\n"
 
-        else:
-            model = info["model"]
+                yield json.dumps({
+                    "type": "done",
+                    "model_used": model,
+                    "token_count": token_count,
+                    "time_seconds": round(time.time() - start, 2),
+                }) + "\n"
+
+        except Exception as e:
             yield json.dumps({
-                "type": "stage",
-                "label": "routing",
-                "detail": f"Routing to {model} ({info['reason']})",
-                "category": info["category"],
-            }) + "\n"
-            yield json.dumps({"type": "stage", "label": "generating", "detail": "Writing the answer..."}) + "\n"
-
-            token_count = 0
-            for token in stream_answer(model, q.query):
-                token_count += 1
-                yield json.dumps({"type": "token", "content": token}) + "\n"
-
-            yield json.dumps({
-                "type": "done",
-                "model_used": model,
-                "token_count": token_count,
+                "type": "error",
+                "detail": str(e),
                 "time_seconds": round(time.time() - start, 2),
             }) + "\n"
 
@@ -237,6 +259,38 @@ def ask_complex(q: Question):
             "sub_tasks": len(tasks),
             "time_seconds": round(time.time() - start, 2),
             "results": results,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ask/image")
+def ask_image_endpoint(q: ImageQuestion):
+    """
+    Ask a question about an image.
+
+    Send a JSON body with:
+      - "query"     : your question about the image (string)
+      - "image_b64" : the image encoded as plain base64 (no data-URI prefix)
+
+    Example (Python):
+        import base64, requests
+        with open("photo.jpg", "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        r = requests.post(
+            "http://localhost:8000/ask/image",
+            json={"query": "What is in this image?", "image_b64": b64}
+        )
+        print(r.json()["answer"])
+    """
+    try:
+        start  = time.time()
+        answer = ask_image(q.image_b64, q.query)
+        return {
+            "type":         "image",
+            "model_used":   "qwen2.5vl:7b",
+            "time_seconds": round(time.time() - start, 2),
+            "answer":       answer,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

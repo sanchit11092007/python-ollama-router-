@@ -5,14 +5,18 @@ ask.py - The Terminal Chat Client, with a visible staged process:
 Commands:
     - Type any question normally (auto-detects if it's multi-part)
     - '/complex ...' to force-split a question
+    - '/image <path> [question]' to ask about an image file on disk
     - 'reset' to clear conversation memory
     - 'exit' to quit
 """
 
 import sys
 import time
+import base64
+import os
 import random
 import threading
+import requests as _requests   # used to fetch images from URLs
 
 if sys.platform == "win32":
     try:
@@ -21,7 +25,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from router import classify_question, stream_answer, break_into_tasks, clear_history
+from router import classify_question, stream_answer, stream_image_answer, break_into_tasks, clear_history
 
 # Rotating status phrases shown while waiting on a model - purely cosmetic,
 # just so the terminal never looks frozen while a big model "thinks".
@@ -141,6 +145,97 @@ def ask_anything(query, force_multi=False):
         handle_single(query, info)
 
 
+def handle_image(source, question):
+    """
+    Accepts either a local file path OR a public image URL.
+    Encodes the image to base64 and sends it to qwen2.5vl:7b.
+
+    HOW TO USE:
+        /image <url_or_path> [optional question]
+
+    Examples (URL):
+        /image https://example.com/photo.jpg
+        /image https://example.com/photo.jpg What breed is this dog?
+
+    Examples (local file):
+        /image C:\\Users\\me\\photo.jpg
+        /image ./diagram.png Explain what this diagram shows.
+
+    Supported formats : PNG, JPEG, JPG, WEBP, GIF
+    """
+    # Strip angle brackets in case user pastes <https://...> style URLs
+    source = source.strip("<>").strip()
+
+    is_url = source.startswith("http://") or source.startswith("https://")
+
+    # ── Fetch from URL ────────────────────────────────────────────
+    if is_url:
+        stage(f"Fetching image from URL...")
+        try:
+            # Use a browser User-Agent - some servers (e.g. Wikipedia) block
+            # Python's default requests agent with a 403 Forbidden response.
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )
+            }
+            resp = _requests.get(source, headers=headers, timeout=15)
+            resp.raise_for_status()
+            image_b64 = base64.b64encode(resp.content).decode()
+            label = source.split("/")[-1].split("?")[0] or "image"
+        except Exception as e:
+            print(f"  [error] Could not fetch URL: {e}\n")
+            return
+
+    # ── Read from local disk ──────────────────────────────────────
+    else:
+        if not os.path.isfile(source):
+            print(f"  [error] File not found: {source}\n")
+            return
+        ext = os.path.splitext(source)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+            print(f"  [error] Unsupported format '{ext}'. Use PNG, JPEG, WEBP, or GIF.\n")
+            return
+        with open(source, "rb") as f:
+            image_b64 = base64.b64encode(f.read()).decode()
+        label = os.path.basename(source)
+
+    if not question:
+        question = "Describe this image in detail."
+
+    stage(f'Image: {label}  |  Question: "{question}"')
+    stage("Routing to vision model: qwen2.5vl:7b")
+    print("-" * 60)
+
+    start_time = time.time()
+
+    # Spinner until first token arrives, then stream live
+    stop = [False]
+    spinner = threading.Thread(target=show_spinner, args=(THINKING_PHRASES, stop, start_time))
+    spinner.start()
+
+    token_count  = 0
+    spinner_done = False
+    for token in stream_image_answer(image_b64, question):
+        if not spinner_done:
+            stop[0] = True
+            spinner.join()
+            spinner_done = True
+        sys.stdout.write(token)
+        sys.stdout.flush()
+        token_count += 1
+
+    if not spinner_done:
+        stop[0] = True
+        spinner.join()
+
+    elapsed = round(time.time() - start_time, 2)
+    print("\n" + "-" * 60)
+    print(f"  Done in {elapsed}s | Model: qwen2.5vl:7b | ~{token_count} tokens\n")
+
+
 def main():
     print("=" * 60)
     print("  LOCAL AI ROUTER - Interactive Chat")
@@ -148,6 +243,11 @@ def main():
     print("  Commands:")
     print("    - Type any question (auto-splits multi-part requests)")
     print("    - /complex <question> to force-split")
+    print("    - /image <url_or_path> [question] to ask about an image")
+    print("        URL:   /image https://example.com/photo.jpg What is this?")
+    print("        File:  /image C:\\Users\\me\\photo.jpg What is this?")
+    print("        Note:  question is optional (defaults to 'Describe this image')")
+    print("        Formats: PNG, JPEG, WEBP, GIF")
     print("    - reset to clear conversation memory")
     print("    - exit / quit to stop")
     print("=" * 60 + "\n")
@@ -167,6 +267,13 @@ def main():
                 continue
             if query.startswith("/complex "):
                 ask_anything(query[len("/complex "):].strip(), force_multi=True)
+            elif query.startswith("/image "):
+                # Format: /image <path> [optional question]
+                rest   = query[len("/image "):].strip()
+                parts  = rest.split(" ", 1)        # split on first space only
+                path   = parts[0]
+                q_text = parts[1].strip() if len(parts) > 1 else ""
+                handle_image(path, q_text)
             else:
                 ask_anything(query)
 

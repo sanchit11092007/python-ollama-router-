@@ -6,6 +6,7 @@ MODELS
     MAIN_MODEL  : the "smart" 14b model -> essays, reasoning, explanations
     FAST_MODEL  : the 7b model -> (a) makes the routing decision itself,
                   (b) answers quick casual chit-chat
+    IMAGE_MODEL : vision model -> answers questions about images
 
 HOW A QUESTION FLOWS
     1. classify_question() asks FAST_MODEL to decide category + whether
@@ -30,11 +31,13 @@ import ollama
 CODER_MODEL = "qwen2.5-coder:latest"
 MAIN_MODEL  = "qwen2.5:14b"
 FAST_MODEL  = "qwen2.5:7b"
+IMAGE_MODEL = "qwen2.5vl:7b"   # vision model - handles image + text queries
 
 AVAILABLE_MODELS = {
     "code":    CODER_MODEL,
     "simple":  FAST_MODEL,
     "complex": MAIN_MODEL,
+    "image":   IMAGE_MODEL,
 }
 
 # ─── Conversation memory ────────────────────────────────────────────────
@@ -179,6 +182,56 @@ def stream_answer(model: str, query: str):
         yield token
 
     add_to_history("user",      query)
+    add_to_history("assistant", full_answer)
+
+
+# ══════════════════════════════════════════════════════════════════
+# IMAGE: Send an image + question to the vision model
+#
+#  image_b64 is a raw base64 string (no data-URI prefix).
+#  Both functions mirror get_full_answer / stream_answer in style.
+# ══════════════════════════════════════════════════════════════════
+
+def ask_image(image_b64: str, query: str) -> str:
+    """
+    Send an image + question to IMAGE_MODEL, return the full answer.
+    image_b64 must be a plain base64-encoded string (PNG / JPEG).
+    """
+    response = ollama.chat(
+        model=IMAGE_MODEL,
+        messages=[{
+            "role":    "user",
+            "content": query,
+            "images":  [image_b64],   # ollama accepts raw base64 here
+        }],
+    )
+    answer = response["message"]["content"]
+    # Save to shared history so follow-up text questions have context
+    add_to_history("user",      f"[image attached] {query}")
+    add_to_history("assistant", answer)
+    return answer
+
+
+def stream_image_answer(image_b64: str, query: str):
+    """
+    Same as ask_image but streams tokens one by one.
+    image_b64 must be a plain base64-encoded string (PNG / JPEG).
+    """
+    full_answer = ""
+    for chunk in ollama.chat(
+        model=IMAGE_MODEL,
+        messages=[{
+            "role":    "user",
+            "content": query,
+            "images":  [image_b64],
+        }],
+        stream=True,
+    ):
+        token        = chunk["message"]["content"]
+        full_answer += token
+        yield token
+
+    add_to_history("user",      f"[image attached] {query}")
     add_to_history("assistant", full_answer)
 
 
