@@ -25,7 +25,36 @@ MEMORY
 """
 
 import json
+import os
 import ollama
+
+_CURRENT_SESSION_FILE = None
+_LOG_CALLBACK = None
+
+def start_new_session(filepath: str):
+    global _CURRENT_SESSION_FILE
+    _CURRENT_SESSION_FILE = filepath
+
+def set_log_callback(cb):
+    global _LOG_CALLBACK
+    _LOG_CALLBACK = cb
+
+def _log_event(event_type: str, data: dict):
+    if _LOG_CALLBACK:
+        try:
+            _LOG_CALLBACK(event_type, data)
+        except Exception:
+            pass
+
+def load_system_prompt() -> str:
+    """Anyone (including non-developers) can edit system_prompt.txt to change behavior."""
+    try:
+        with open("system_prompt.txt", "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        print("[Warning] system_prompt.txt not found! Using hardcoded default.")
+        return "You are a helpful, honest, on-premise AI assistant for industrial/confidential work."
+
 
 # ─── Models (must match `ollama list` on your machine) ─────────────────
 CODER_MODEL = "qwen2.5-coder:latest"
@@ -48,6 +77,28 @@ MAX_TURNS = 12
 def add_to_history(role: str, content: str):
     HISTORY.append({"role": role, "content": content})
     del HISTORY[:-MAX_TURNS]
+    
+    if _CURRENT_SESSION_FILE:
+        try:
+            session_data = []
+            if os.path.isfile(_CURRENT_SESSION_FILE):
+                with open(_CURRENT_SESSION_FILE, "r", encoding="utf-8") as f:
+                    try:
+                        session_data = json.load(f)
+                    except json.JSONDecodeError:
+                        pass
+            
+            import time
+            session_data.append({
+                "role": role, 
+                "content": content, 
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            })
+            
+            with open(_CURRENT_SESSION_FILE, "w", encoding="utf-8") as f:
+                json.dump(session_data, f, indent=2)
+        except Exception as e:
+            print(f"[Error saving session]: {e}")
 
 
 def get_history() -> list:
@@ -141,13 +192,15 @@ def classify_question(query: str) -> dict:
         is_multi_part    = has_code_explain or " and " in query.lower()
         reason           = "fallback keyword match (model reply was not valid JSON)"
 
-    return {
+    result_data = {
         "category":             category,
         "model":                pick_model(category),
         "is_multi_part":        is_multi_part,
         "has_code_and_explain": has_code_explain,
         "reason":               reason,
     }
+    _log_event("classify", {"query": query, "result": result_data})
+    return result_data
 
 
 def pick_model(category: str) -> str:
@@ -159,30 +212,110 @@ def pick_model(category: str) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 def _build_messages(query: str) -> list:
-    return HISTORY + [{"role": "user", "content": query}]
+    sys_prompt = load_system_prompt()
+    return [{"role": "system", "content": sys_prompt}] + HISTORY + [{"role": "user", "content": query}]
+
+
+def _get(obj, *keys, default=None):
+    """Safely get nested attribute/key from ollama response objects or dicts."""
+    for key in keys:
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            obj = obj.get(key)
+        else:
+            obj = getattr(obj, key, None)
+    return obj if obj is not None else default
 
 
 def get_full_answer(model: str, query: str) -> str:
+    from tools import TOOL_SCHEMAS, TOOL_FUNCTIONS
+    _log_event("model_start", {"model": model, "query": query})
     messages = _build_messages(query)
-    response = ollama.chat(model=model, messages=messages)
-    answer   = response["message"]["content"]
+
+    response = ollama.chat(model=model, messages=messages, tools=TOOL_SCHEMAS)
+
+    tool_calls = _get(response, "message", "tool_calls") or []
+    if tool_calls:
+        messages.append(response["message"] if isinstance(response, dict) else {
+            "role": "assistant",
+            "content": _get(response, "message", "content") or "",
+            "tool_calls": tool_calls,
+        })
+        for tool_call in tool_calls:
+            func_name = _get(tool_call, "function", "name")
+            args = _get(tool_call, "function", "arguments") or {}
+
+            if func_name in TOOL_FUNCTIONS:
+                try:
+                    result = TOOL_FUNCTIONS[func_name](**args)
+                except Exception as e:
+                    result = f"Error: {e}"
+            else:
+                result = f"Error: Function {func_name} not found"
+
+            _log_event("tool_call", {"tool": func_name, "args": args, "result": str(result)})
+            messages.append({"role": "tool", "content": str(result)})
+
+        response = ollama.chat(model=model, messages=messages)
+
+    answer = _get(response, "message", "content") or ""
 
     add_to_history("user",      query)
     add_to_history("assistant", answer)
+    _log_event("model_done", {"model": model, "answer": answer})
     return answer
 
 
 def stream_answer(model: str, query: str):
+    from tools import TOOL_SCHEMAS, TOOL_FUNCTIONS
+    _log_event("stream_start", {"model": model, "query": query})
     messages    = _build_messages(query)
     full_answer = ""
 
-    for chunk in ollama.chat(model=model, messages=messages, stream=True):
-        token        = chunk["message"]["content"]
-        full_answer += token
-        yield token
+    response_msg = {"role": "assistant", "content": ""}
+    tool_calls = []
+
+    for chunk in ollama.chat(model=model, messages=messages, stream=True, tools=TOOL_SCHEMAS):
+        chunk_tool_calls = _get(chunk, "message", "tool_calls") or []
+        if chunk_tool_calls:
+            tool_calls.extend(chunk_tool_calls)
+
+        token = _get(chunk, "message", "content") or ""
+        if token:
+            full_answer += token
+            response_msg["content"] += token
+            yield token
+
+    if tool_calls:
+        response_msg["tool_calls"] = tool_calls
+        messages.append(response_msg)
+
+        for tool_call in tool_calls:
+            func_name = _get(tool_call, "function", "name")
+            args = _get(tool_call, "function", "arguments") or {}
+            yield f"\n\n[System: Calling tool '{func_name}'...]\n"
+
+            if func_name in TOOL_FUNCTIONS:
+                try:
+                    result = TOOL_FUNCTIONS[func_name](**args)
+                except Exception as e:
+                    result = f"Error: {e}"
+            else:
+                result = f"Error: Function {func_name} not found"
+
+            _log_event("tool_call", {"tool": func_name, "args": args, "result": str(result)})
+            messages.append({"role": "tool", "content": str(result)})
+
+        for chunk in ollama.chat(model=model, messages=messages, stream=True):
+            token = _get(chunk, "message", "content") or ""
+            if token:
+                full_answer += token
+                yield token
 
     add_to_history("user",      query)
     add_to_history("assistant", full_answer)
+    _log_event("stream_done", {"model": model, "answer": full_answer})
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -197,6 +330,7 @@ def ask_image(image_b64: str, query: str) -> str:
     Send an image + question to IMAGE_MODEL, return the full answer.
     image_b64 must be a plain base64-encoded string (PNG / JPEG).
     """
+    _log_event("image_start", {"model": IMAGE_MODEL, "query": query, "image_size_b64": len(image_b64)})
     response = ollama.chat(
         model=IMAGE_MODEL,
         messages=[{
@@ -209,6 +343,7 @@ def ask_image(image_b64: str, query: str) -> str:
     # Save to shared history so follow-up text questions have context
     add_to_history("user",      f"[image attached] {query}")
     add_to_history("assistant", answer)
+    _log_event("image_done", {"model": IMAGE_MODEL, "answer": answer})
     return answer
 
 
@@ -217,6 +352,7 @@ def stream_image_answer(image_b64: str, query: str):
     Same as ask_image but streams tokens one by one.
     image_b64 must be a plain base64-encoded string (PNG / JPEG).
     """
+    _log_event("image_start", {"model": IMAGE_MODEL, "query": query, "image_size_b64": len(image_b64)})
     full_answer = ""
     for chunk in ollama.chat(
         model=IMAGE_MODEL,
@@ -233,6 +369,7 @@ def stream_image_answer(image_b64: str, query: str):
 
     add_to_history("user",      f"[image attached] {query}")
     add_to_history("assistant", full_answer)
+    _log_event("image_done", {"model": IMAGE_MODEL, "answer": full_answer})
 
 
 # ══════════════════════════════════════════════════════════════════

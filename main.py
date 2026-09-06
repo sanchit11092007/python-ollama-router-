@@ -1,27 +1,45 @@
 """
-main.py - The FastAPI Server
+main.py - The FastAPI Server for Agent OTG
 
 Endpoints:
     GET  /            -> Status page
     GET  /health      -> Check if Ollama is running
-    POST /ask         -> Ask a question, auto-detects single vs multi-part
-    POST /ask/stream  -> Same, but streamed with visible stages
+    POST /ask         -> Ask a question, auto-detects single vs multi-part vs sequential
+    POST /ask/stream  -> Same, but streamed with visible stages and token chunks
     POST /ask/complex -> Force-split a question into sub-tasks
     POST /ask/image   -> Ask a question about an image (base64)
+    POST /ask/agent   -> LangGraph agent: structured tool-calling graph
     POST /reset       -> Clear conversation memory
 
 Run with:
-    uvicorn main:app --reload
+    py -m uvicorn main:app --reload
 """
+
+import os
+import sys
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import json
 import time
+import datetime
+from contextlib import asynccontextmanager
+
+from offline_guard import enable_offline_mode
+enable_offline_mode()
+
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import router
 from router import (
     classify_question,
     stream_answer,
@@ -30,13 +48,107 @@ from router import (
     run_sequential_tasks,
     clear_history,
     ask_image,
+    get_history,
     AVAILABLE_MODELS,
+    CODER_MODEL,
+    MAIN_MODEL,
 )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SERVER LOGGING SYSTEM
+# Provides clear, emoji-rich, structured console logging on the Uvicorn server
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _now_str() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _safe_print(msg: str):
+    try:
+        print(msg, flush=True)
+    except (UnicodeEncodeError, Exception):
+        try:
+            print(msg.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8"), flush=True)
+        except Exception:
+            print(msg.encode("ascii", errors="replace").decode("ascii"), flush=True)
+
+def log_user(msg: str):
+    _safe_print(f"\033[94m[{_now_str()}] 📥 [USER ACTION] {msg}\033[0m")
+
+def log_router(msg: str):
+    _safe_print(f"\033[95m[{_now_str()}] 🧠 [ROUTER] {msg}\033[0m")
+
+def log_model(msg: str):
+    _safe_print(f"\033[96m[{_now_str()}] 🤖 [MODEL] {msg}\033[0m")
+
+def log_tool(msg: str):
+    _safe_print(f"\033[93m[{_now_str()}] 🛠️ [TOOL] {msg}\033[0m")
+
+def log_response(msg: str):
+    _safe_print(f"\033[92m[{_now_str()}] 📤 [RESPONSE] {msg}\033[0m")
+
+def log_stream(msg: str):
+    _safe_print(f"\033[90m[{_now_str()}] 🌊 [STREAM] {msg}\033[0m")
+
+def log_system(msg: str):
+    _safe_print(f"\033[97m[{_now_str()}] ⚙️ [SYSTEM] {msg}\033[0m")
+
+def log_err(msg: str):
+    _safe_print(f"\033[91m[{_now_str()}] ❌ [ERROR] {msg}\033[0m")
+
+
+# Hook router.py's internal events into our server logger
+def _router_event_listener(event_type: str, data: dict):
+    if event_type == "classify":
+        res = data.get("result", {})
+        log_router(
+            f'Classified query="{data.get("query", "")[:60]}" -> '
+            f'category={res.get("category")} | model={res.get("model")} | '
+            f'is_multi={res.get("is_multi_part")} | has_code_explain={res.get("has_code_and_explain")}'
+        )
+    elif event_type == "model_start":
+        log_model(f'Invoking model={data.get("model")} | query="{data.get("query", "")[:70]}"')
+    elif event_type == "model_done":
+        ans_preview = data.get("answer", "").replace("\n", " ")[:100]
+        log_model(f'Model {data.get("model")} completed answer -> "{ans_preview}..."')
+    elif event_type == "stream_start":
+        log_stream(f'Streaming started for model={data.get("model")} | query="{data.get("query", "")[:70]}"')
+    elif event_type == "stream_done":
+        ans_preview = data.get("answer", "").replace("\n", " ")[:100]
+        log_stream(f'Streaming finished for model={data.get("model")} | final="{ans_preview}..."')
+    elif event_type == "tool_call":
+        log_tool(f'Tool "{data.get("tool")}" called with args={data.get("args")} -> result={data.get("result")[:120]}')
+    elif event_type == "image_start":
+        log_model(f'Vision model={data.get("model")} analyzing image (b64 size: {data.get("image_size_b64", 0)} chars) | query="{data.get("query", "")}"')
+    elif event_type == "image_done":
+        ans_preview = data.get("answer", "").replace("\n", " ")[:100]
+        log_model(f'Vision model completed -> "{ans_preview}..."')
+
+router.set_log_callback(_router_event_listener)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIFESPAN & APP INIT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    os.makedirs("chat_sessions", exist_ok=True)
+    session_file = os.path.join(
+        "chat_sessions",
+        datetime.datetime.now().strftime("server_session_%Y-%m-%d_%H-%M-%S.json")
+    )
+    router.start_new_session(session_file)
+    log_system("Agent OTG FastAPI Server Started")
+    log_system(f"Active Session File: {session_file}")
+    log_system(f"Configured Models: {AVAILABLE_MODELS}")
+    yield
+    log_system("Agent OTG FastAPI Server Stopping...")
+
 app = FastAPI(
-    title="Local AI Router",
+    title="Agent OTG",
     description="Routes questions to the best local AI model",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -45,6 +157,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_requests_middleware(request: Request, call_next):
+    start_time = time.time()
+    client_host = request.client.host if request.client else "unknown"
+    method = request.method
+    path = request.url.path
+
+    # Log incoming request summary for non-health endpoints to avoid noise
+    if path != "/health":
+        log_user(f"Incoming {method} {path} from {client_host}")
+
+    try:
+        response = await call_next(request)
+        elapsed = round(time.time() - start_time, 3)
+        if path != "/health":
+            log_response(f"Completed {method} {path} with HTTP {response.status_code} in {elapsed}s")
+        return response
+    except Exception as exc:
+        elapsed = round(time.time() - start_time, 3)
+        log_err(f"Failed {method} {path} with exception: {exc} (after {elapsed}s)")
+        raise
 
 
 class Question(BaseModel):
@@ -63,12 +198,21 @@ class ImageQuestion(BaseModel):
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
 @app.get("/")
 def home():
+    log_system("Client requested server status page /")
     return {
         "status": "online",
         "models": AVAILABLE_MODELS,
-        "endpoints": ["/ask", "/ask/stream", "/ask/complex", "/ask/image", "/reset", "/health", "/docs"],
+        "endpoints": [
+            "/ask", "/ask/stream", "/ask/complex",
+            "/ask/image", "/ask/agent",
+            "/reset", "/health", "/docs",
+        ],
     }
 
 
@@ -76,14 +220,18 @@ def home():
 def health():
     try:
         r = requests.get("http://localhost:11434/api/tags", timeout=3)
-        return {"ollama": "connected" if r.status_code == 200 else "error"}
-    except Exception:
+        status = "connected" if r.status_code == 200 else "error"
+        return {"ollama": status}
+    except Exception as exc:
+        log_err(f"Health check failed to reach Ollama: {exc}")
         return {"ollama": "disconnected"}
 
 
 @app.post("/reset")
 def reset():
+    log_user("Requested conversation memory reset")
     clear_history()
+    log_system("Conversation history cleared from memory")
     return {"status": "conversation memory cleared"}
 
 
@@ -91,13 +239,13 @@ def reset():
 def ask(q: Question):
     try:
         start  = time.time()
+        log_user(f'Query: "{q.query}"')
         info   = classify_question(q.query)
         stages = [{"stage": "understanding", "detail": f'category = "{info["category"]}"'}]
 
         # ── Path A: Code + Explain (sequential, ordered pipeline) ──────
-        # Step 1: CODER_MODEL generates the code.
-        # Step 2: MAIN_MODEL reads history and writes the explanation.
         if info["has_code_and_explain"]:
+            log_router(f'Detected Code + Explain combo request. Executing 2-step sequential pipeline...')
             stages.append({
                 "stage":  "planning",
                 "detail": "Code + explain request — running sequential pipeline...",
@@ -110,8 +258,9 @@ def ask(q: Question):
                     "detail": f"Step {r['step']}: {r['label']} → {r['model_used']}",
                 })
 
+            elapsed = round(time.time() - start, 2)
+            log_response(f"Sequential pipeline completed in {elapsed}s across {len(results)} steps")
             return {
-                # "type" tells the caller exactly which path was taken
                 "type":        "sequential",
                 "description": (
                     "Code was generated first by the coder model, then passed "
@@ -119,8 +268,7 @@ def ask(q: Question):
                 ),
                 "stages":       stages,
                 "steps_run":    len(results),
-                "time_seconds": round(time.time() - start, 2),
-                # Every result item clearly names which model handled it
+                "time_seconds": elapsed,
                 "results": [
                     {
                         "step":       r["step"],
@@ -135,6 +283,7 @@ def ask(q: Question):
 
         # ── Path B: Generic multi-part (independent sub-tasks) ─────────
         if info["is_multi_part"]:
+            log_router("Detected multi-part question. Splitting into independent sub-tasks...")
             stages.append({"stage": "planning", "detail": "Multi-part request detected, splitting..."})
             tasks   = break_into_tasks(q.query)
             results = []
@@ -143,6 +292,7 @@ def ask(q: Question):
                     "stage":  "working",
                     "detail": f"Sub-task {i+1}: {task['label']} → {task['model']}",
                 })
+                log_model(f"Running sub-task {i+1}/{len(tasks)}: '{task['label']}' on model {task['model']}")
                 answer = get_full_answer(task["model"], task["task"])
                 results.append({
                     "task_number": i + 1,
@@ -151,17 +301,25 @@ def ask(q: Question):
                     "category":    task["category"],
                     "answer":      answer,
                 })
+
+            elapsed = round(time.time() - start, 2)
+            log_response(f"Multi-part execution completed in {elapsed}s across {len(tasks)} sub-tasks")
             return {
                 "type":         "multi",
                 "stages":       stages,
                 "sub_tasks":    len(tasks),
-                "time_seconds": round(time.time() - start, 2),
+                "time_seconds": elapsed,
                 "results":      results,
             }
 
+        # ── Path C: Single model execution ────────────────────────────
         stages.append({"stage": "routing", "detail": f'{info["model"]} - {info["reason"]}'})
+        log_router(f'Routing to single model {info["model"]} (Category: {info["category"]})')
         answer = get_full_answer(info["model"], q.query)
         stages.append({"stage": "done", "detail": "answer generated"})
+
+        elapsed = round(time.time() - start, 2)
+        log_response(f'Single task completed in {elapsed}s by {info["model"]}')
 
         return {
             "type": "single",
@@ -169,16 +327,19 @@ def ask(q: Question):
             "model_used": info["model"],
             "category": info["category"],
             "reason": info["reason"],
-            "time_seconds": round(time.time() - start, 2),
+            "time_seconds": elapsed,
             "answer": answer,
         }
 
     except Exception as e:
+        log_err(f"Exception in /ask: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ask/stream")
 def ask_stream(q: Question):
+    log_user(f'Stream Request: "{q.query}"')
+
     def generate():
         start = time.time()
 
@@ -186,7 +347,51 @@ def ask_stream(q: Question):
             yield json.dumps({"type": "stage", "label": "understanding", "detail": "Reading your question..."}) + "\n"
             info = classify_question(q.query)
 
-            if info["is_multi_part"]:
+            # ── Path A: Code + Explain sequential streaming ───────────
+            if info["has_code_and_explain"]:
+                log_router("Stream request: executing Code + Explain sequential pipeline")
+                yield json.dumps({
+                    "type": "stage",
+                    "label": "planning",
+                    "detail": "Code + explain combo detected — preparing 2-stage sequential generation...",
+                }) + "\n"
+
+                # Step 1: Code generation
+                yield json.dumps({
+                    "type": "stage",
+                    "label": "working",
+                    "detail": f"Step 1/2: Generating code with {CODER_MODEL}...",
+                }) + "\n"
+                code_prompt = (
+                    f"The user asked: \"{q.query}\"\n\n"
+                    "Your job for this step: write ONLY the code. "
+                    "Do not explain it yet — just provide clean, well-commented code."
+                )
+                for token in stream_answer(CODER_MODEL, code_prompt):
+                    yield json.dumps({"type": "token", "step": 1, "content": token}) + "\n"
+                yield json.dumps({"type": "step_done", "step": 1}) + "\n"
+
+                # Step 2: Explanation
+                yield json.dumps({
+                    "type": "stage",
+                    "label": "working",
+                    "detail": f"Step 2/2: Writing explanation with {MAIN_MODEL}...",
+                }) + "\n"
+                explain_prompt = (
+                    "Now explain the code you just wrote above, step by step. "
+                    "Be clear and beginner-friendly. Cover what each part does and why."
+                )
+                for token in stream_answer(MAIN_MODEL, explain_prompt):
+                    yield json.dumps({"type": "token", "step": 2, "content": token}) + "\n"
+                yield json.dumps({"type": "step_done", "step": 2}) + "\n"
+
+                elapsed = round(time.time() - start, 2)
+                log_stream(f"Sequential streaming finished in {elapsed}s")
+                yield json.dumps({"type": "done", "time_seconds": elapsed}) + "\n"
+
+            # ── Path B: Generic multi-part streaming ──────────────────
+            elif info["is_multi_part"]:
+                log_router("Stream request: breaking down multi-part sub-tasks")
                 yield json.dumps({"type": "stage", "label": "planning", "detail": "Multi-part request detected, breaking it down..."}) + "\n"
                 tasks = break_into_tasks(q.query)
                 yield json.dumps({
@@ -204,10 +409,14 @@ def ask_stream(q: Question):
                         yield json.dumps({"type": "token", "task_number": i, "content": token}) + "\n"
                     yield json.dumps({"type": "task_done", "task_number": i}) + "\n"
 
-                yield json.dumps({"type": "done", "time_seconds": round(time.time() - start, 2)}) + "\n"
+                elapsed = round(time.time() - start, 2)
+                log_stream(f"Multi-part streaming finished in {elapsed}s")
+                yield json.dumps({"type": "done", "time_seconds": elapsed}) + "\n"
 
+            # ── Path C: Single model streaming ────────────────────────
             else:
                 model = info["model"]
+                log_router(f"Stream request: routing to {model}")
                 yield json.dumps({
                     "type": "stage",
                     "label": "routing",
@@ -221,14 +430,17 @@ def ask_stream(q: Question):
                     token_count += 1
                     yield json.dumps({"type": "token", "content": token}) + "\n"
 
+                elapsed = round(time.time() - start, 2)
+                log_stream(f"Single model streaming finished in {elapsed}s with ~{token_count} tokens")
                 yield json.dumps({
                     "type": "done",
                     "model_used": model,
                     "token_count": token_count,
-                    "time_seconds": round(time.time() - start, 2),
+                    "time_seconds": elapsed,
                 }) + "\n"
 
         except Exception as e:
+            log_err(f"Exception during streaming: {e}")
             yield json.dumps({
                 "type": "error",
                 "detail": str(e),
@@ -242,10 +454,13 @@ def ask_stream(q: Question):
 def ask_complex(q: Question):
     try:
         start = time.time()
+        log_user(f'Force-Split Complex Request: "{q.query}"')
         tasks = break_into_tasks(q.query)
+        log_router(f"Split into {len(tasks)} sub-tasks")
 
         results = []
         for i, task in enumerate(tasks):
+            log_model(f"Running sub-task {i+1}: '{task['label']}' -> {task['model']}")
             answer = get_full_answer(task["model"], task["task"])
             results.append({
                 "task_number": i + 1,
@@ -255,42 +470,82 @@ def ask_complex(q: Question):
                 "answer": answer,
             })
 
+        elapsed = round(time.time() - start, 2)
+        log_response(f"Complex tasks finished in {elapsed}s")
         return {
             "sub_tasks": len(tasks),
-            "time_seconds": round(time.time() - start, 2),
+            "time_seconds": elapsed,
             "results": results,
         }
     except Exception as e:
+        log_err(f"Exception in /ask/complex: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ask/image")
 def ask_image_endpoint(q: ImageQuestion):
-    """
-    Ask a question about an image.
-
-    Send a JSON body with:
-      - "query"     : your question about the image (string)
-      - "image_b64" : the image encoded as plain base64 (no data-URI prefix)
-
-    Example (Python):
-        import base64, requests
-        with open("photo.jpg", "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        r = requests.post(
-            "http://localhost:8000/ask/image",
-            json={"query": "What is in this image?", "image_b64": b64}
-        )
-        print(r.json()["answer"])
-    """
     try:
         start  = time.time()
+        log_user(f'Image Query: "{q.query}" (b64 length: {len(q.image_b64)})')
         answer = ask_image(q.image_b64, q.query)
+        elapsed = round(time.time() - start, 2)
+        log_response(f"Image analysis completed in {elapsed}s by qwen2.5vl:7b")
         return {
             "type":         "image",
             "model_used":   "qwen2.5vl:7b",
-            "time_seconds": round(time.time() - start, 2),
+            "time_seconds": elapsed,
             "answer":       answer,
         }
     except Exception as e:
+        log_err(f"Exception in /ask/image: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ask/agent")
+def ask_agent(q: Question):
+    """
+    LangGraph agent endpoint.
+    Runs the question through a structured 3-node graph:
+      1. classify  — decides if a tool is needed and which one
+      2. tools     — executes the real tool from tools.py (if needed)
+      3. respond   — generates the final answer with full context
+    """
+    try:
+        start = time.time()
+        log_user(f'LangGraph Agent Request: "{q.query}"')
+
+        try:
+            from langgraph_agent import run_agent
+        except ImportError as exc:
+            log_err(f"LangGraph not installed: {exc}")
+            raise HTTPException(
+                status_code=500,
+                detail="LangGraph packages not installed. Run: py -m pip install langgraph langchain-ollama"
+            )
+
+        history = get_history()
+        log_model("Running LangGraph agent (Node pipeline: classify -> tools? -> respond)...")
+        result = run_agent(q.query, history=history)
+
+        if result.get("needs_tool"):
+            for t in result.get("tool_log", []):
+                log_tool(f"Agent tool executed: {t.get('tool')} with {t.get('args')} -> {str(t.get('result'))[:120]}")
+        else:
+            log_model("Agent decided: direct response (no tool needed)")
+
+        elapsed = round(time.time() - start, 2)
+        log_response(f"LangGraph agent completed in {elapsed}s")
+
+        return {
+            "type":         "agent",
+            "model_used":   "qwen2.5:14b (LangGraph)",
+            "time_seconds": elapsed,
+            "needs_tool":   result["needs_tool"],
+            "tool_log":     result["tool_log"],
+            "answer":       result["final_answer"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_err(f"Exception in /ask/agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))

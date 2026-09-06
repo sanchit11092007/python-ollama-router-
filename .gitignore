@@ -18,3 +18,12 @@ ENV/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Generated output files (created at runtime, not source code)
+generated_files/
+
+# ChromaDB vector store (rebuilt automatically from ingested documents)
+chroma_db/
+
+# Chat session logs (personal data, not source code)
+chat_sessions/

@@ -1,5 +1,17 @@
+# ── Core Agent OTG dependencies ───────────────────────────────────────────────
 fastapi
 uvicorn
 requests
 ollama
 pydantic
+pandas
+openpyxl
+PyMuPDF
+python-docx
+rich
+reportlab
+pdfplumber
+pypdf
+chromadb
+langgraph
+langchain-ollama
