@@ -177,93 +177,60 @@ def _check_ollama_models() -> dict:
 
 
 def print_welcome_banner():
+    # ── DWE Team Credits (like OpenAI's "ChatGPT is made by OpenAI") ──────────
+    import config as _cfg
+    credits_text = (
+        f"[bold white]{_cfg.APP_NAME}[/bold white]  [dim]v{_cfg.APP_VERSION}[/dim]\n\n"
+        f"[dim]Crafted with ❤️  by the [/dim][bold bright_magenta]{_cfg.APP_TEAM}[/bold bright_magenta]\n"
+        "[dim]Sanchit  •  DWE Member 2  •  DWE Member 3[/dim]\n\n"
+        "[dim]🔒 100% On-Premise  •  Air-Gapped  •  No cloud  •  No tracking[/dim]\n"
+        "[dim]Your data never leaves this machine.[/dim]"
+    )
+    console.print(Panel(
+        credits_text,
+        box=box.DOUBLE,
+        border_style="bright_magenta",
+        padding=(1, 4),
+        title="[bold bright_magenta]★  Agent OTG  ★[/bold bright_magenta]",
+        subtitle="[dim]Made by DWE Team[/dim]",
+    ))
+
     banner_text = (
-        "[bold cyan]🤖 AGENT OTG — Local Autonomous Multi-Model System[/bold cyan]\n"
-        "[dim]100% On-Premise • Air-Gapped / Private • Real-Time Routing • LangGraph Tools[/dim]"
+        "[bold cyan]🤖 AGENT OTG — Local Autonomous Multi-Model AI System[/bold cyan]\n"
+        "[dim]100% On-Premise • Air-Gapped / Private • RAG Knowledge Base • LangGraph Tools[/dim]"
     )
     console.print(Panel(banner_text, box=box.ROUNDED, border_style="cyan", padding=(1, 2)))
 
-    table = Table(title="🚀 Available Capabilities & Command Guide", box=box.SIMPLE_HEAVY, border_style="bright_blue")
-    table.add_column("Capability", style="bold green", no_wrap=True)
-    table.add_column("Command / Trigger", style="yellow")
-    table.add_column("Model Assigned", style="magenta")
-    table.add_column("Description", style="white")
+    table = Table(
+        title="🚀 Capabilities & Shortcut Command Guide",
+        box=box.SIMPLE_HEAVY,
+        border_style="bright_blue",
+    )
+    table.add_column("Capability",       style="bold green", no_wrap=True)
+    table.add_column("Shortcut / Trigger", style="yellow")
+    table.add_column("Model",            style="magenta")
+    table.add_column("Description",      style="white")
 
-    table.add_row(
-        "💻 Code Generation & Debugging",
-        "Write a Python script for...",
-        CODER_MODEL,
-        "Auto-routes programming, bugs, scripts, SQL"
-    )
-    table.add_row(
-        "🔄 Code + Walkthrough",
-        "Write X and explain how it works",
-        f"{CODER_MODEL} ➔ {MAIN_MODEL}",
-        "Sequential 2-step pipeline (Code first, then explanation)"
-    )
-    table.add_row(
-        "🧠 Deep Reasoning & Essays",
-        "Explain quantum computing...",
-        MAIN_MODEL,
-        "Complex rationale, essays, logic, architecture"
-    )
-    table.add_row(
-        "⚡ Quick Chat & Math",
-        "Hello / What is 25 * 4?",
-        FAST_MODEL,
-        "Instant responses, small-talk, rapid answers"
-    )
-    table.add_row(
-        "🗂️ Multi-Task Decomposition",
-        "/complex <your query>",
-        "Dynamic Multi-Model",
-        "Splits request into independent parallel sub-tasks"
-    )
-    table.add_row(
-        "👁️ Vision / Image Q&A",
-        '/image <path_or_url> [question]',
-        IMAGE_MODEL,
-        "Inspect diagrams, photos, screenshots, charts"
-    )
-    table.add_row(
-        "📄 Document Ingestion",
-        'upload <path_to_file>',
-        "Context Injector",
-        "Extracts and queries .xlsx, .pdf, or .docx data"
-    )
-    table.add_row(
-        "🛠️ LangGraph Agent",
-        '/agent <instruction>',
-        "qwen2.5:14b + Tools",
-        "Autonomous agent: create PDF, Word, CSV, extract text & more"
-    )
-    table.add_row(
-        "📜 Session History",
-        'history',
-        "Session Store",
-        "Browse past chat sessions with message preview"
-    )
-    table.add_row(
-        "🗑️ List Output Files",
-        '/files',
-        "File Manager",
-        "List all generated files (PDFs, Word docs, CSVs)"
-    )
-    table.add_row(
-        "🧹 Reset Memory",
-        'reset',
-        "Memory Guard",
-        "Clears current conversation context from RAM"
-    )
-    table.add_row(
-        "❓ Full Help / Cheat Sheet",
-        'help or /help',
-        "Guide",
-        "Re-displays this command matrix with sample prompts"
-    )
+    table.add_row("💻 Code Generation",    "Write a Python script for...",         CODER_MODEL,                    "Auto-routes programming, bugs, scripts, SQL")
+    table.add_row("🔄 Code + Walkthrough", "Write X and explain how it works",      f"{CODER_MODEL} ➔ {MAIN_MODEL}",  "Sequential 2-step pipeline")
+    table.add_row("🧠 Deep Reasoning",     "Explain quantum computing...",          MAIN_MODEL,                     "Essays, logic, architecture, analysis")
+    table.add_row("⚡ Quick Chat",          "Hello / What is 25 * 4?",               FAST_MODEL,                     "Instant responses, small-talk")
+    table.add_row("🔍 RAG Search",         "/rag <question>",                       MAIN_MODEL,                     "Search knowledge base with query expansion")
+    table.add_row("📂 Ingest to RAG KB",   "/doc <file path>",                     "Vector Store",                 "Index PDF/DOCX/CSV/Excel into knowledge base")
+    table.add_row("📊 KB Stats",           "/kb",                                  "Vector Store",                 "Show indexed chunk count & collection info")
+    table.add_row("🗂️ Multi-Task",          "/complex <query>",                     "Dynamic Multi-Model",          "Split into independent parallel sub-tasks")
+    table.add_row("👁️ Vision / Image",      "/image <path|url> [q]  or  /img",     IMAGE_MODEL,                    "Inspect diagrams, photos, screenshots")
+    table.add_row("📄 Upload (legacy)",     "upload <file path>",                  "Context Injector",             "Attach file content directly to prompt")
+    table.add_row("🛠️ LangGraph Agent",     "/agent <instruction>",                "qwen2.5:14b + Tools",          "Autonomous multi-tool agent (PDF, Word, CSV…)")
+    table.add_row("🤖 Show Models",        "/models",                              "Config (.env)",                "Display models currently set in .env")
+    table.add_row("🚫 Cancel Context",     "/cancel",                              "Memory",                       "Clear active file attachment from prompt")
+    table.add_row("📜 Session History",    "history",                              "PostgreSQL",                   "Browse saved chat sessions from DB")
+    table.add_row("🗑️ List Output Files",  "/files",                               "File Manager",                 "List all generated files (PDFs, Word, CSVs)")
+    table.add_row("🧹 Reset Memory",       "reset  or  /reset",                    "Memory Guard",                 "Clear conversation context from RAM")
+    table.add_row("❓ Help",               "help  or  /help",                      "Guide",                        "Re-display this command matrix")
 
     console.print(table)
-    console.print("[dim]Type your question directly or use any command above. Type [bold red]exit[/bold red] to quit.[/dim]\n")
+    console.print("[dim]Type your question or use any shortcut above. Type [bold red]exit[/bold red] to quit.[/dim]\n")
 
 
 def print_help_guide():
@@ -565,10 +532,115 @@ def handle_image(source, question):
 
 def handle_list_files():
     """Show all files in the generated_files/ directory."""
-    from tools import _OUTPUT_DIR, list_generated_files
+    from tools import list_generated_files
     result = list_generated_files()
     console.print(Panel(result, title="🗂️ Generated Files", border_style="green", padding=(0, 1)))
     console.print()
+
+
+def handle_rag(query: str):
+    """Directly search the RAG knowledge base with query expansion."""
+    if not query.strip():
+        console.print("  [dim]Usage: /rag <your question>[/dim]\n")
+        return
+    stage("🔍 [RAG Search]", f'Knowledge base query: "[cyan]{query[:70]}[/cyan]"', style="bold blue")
+    console.print("-" * 65, style="dim")
+    start = time.time()
+    try:
+        from rag.pipeline import answer as _rag_answer
+        result = run_with_spinner(
+            ["Expanding query variants...", "Retrieving relevant chunks...", "Synthesizing answer..."],
+            lambda: _rag_answer(query),
+        )
+        ans      = result.get("answer", "No answer found.")
+        sources  = result.get("sources", [])
+        strategy = result.get("retrieval_strategy", "similarity")
+
+        console.print(Markdown(ans))
+
+        if sources:
+            console.print("\n  [dim]Sources cited:[/dim]")
+            for s in sources[:6]:
+                src  = s.get("source", "unknown")
+                page = f", page {s['page']}" if s.get("page") else ""
+                console.print(f"  [dim]  • {src}{page}[/dim]")
+
+        elapsed = round(time.time() - start, 2)
+        console.print("-" * 65, style="dim")
+        console.print(
+            f"  ✅ [bold green]RAG done in {elapsed}s[/bold green] "
+            f"| Strategy: [cyan]{strategy}[/cyan] "
+            f"| [yellow]{len(sources)}[/yellow] source(s)\n"
+        )
+    except Exception as exc:
+        console.print(f"  ❌ [bold red]RAG search failed:[/bold red] {exc}\n")
+
+
+def handle_doc(path: str):
+    """Ingest a file into the RAG vector knowledge base."""
+    path = _clean_path(path)
+    if not path or not os.path.isfile(path):
+        console.print(f"  ❌ [bold red]File not found:[/bold red] {path or '(no path given)'}\n")
+        return
+    stage("📂 [RAG Ingest]", f"Indexing [bold yellow]{os.path.basename(path)}[/bold yellow] into knowledge base...", style="bold green")
+    console.print("-" * 65, style="dim")
+    start = time.time()
+    try:
+        from rag.pipeline import ingest_path as _ingest
+        result  = run_with_spinner(
+            ["Loading file...", "Splitting into chunks...", "Embedding and indexing..."],
+            lambda: _ingest(path, replace_existing=True),
+        )
+        elapsed = round(time.time() - start, 2)
+        chunks  = result.get("chunks_indexed", 0)
+        docs    = result.get("documents_loaded", 0)
+        console.print("-" * 65, style="dim")
+        stage(
+            "✅ [Ingested]",
+            f"[bold green]{os.path.basename(path)}[/bold green] → "
+            f"[yellow]{docs}[/yellow] doc(s), [yellow]{chunks}[/yellow] chunk(s) in {elapsed}s",
+            style="bold green",
+        )
+        console.print("  [dim]Now ask: /rag <question about this document>[/dim]\n")
+    except Exception as exc:
+        console.print(f"  ❌ [bold red]Ingestion failed:[/bold red] {exc}\n")
+
+
+def handle_kb_stats():
+    """Show RAG knowledge base statistics."""
+    try:
+        from rag.vectorstore import get_vector_store
+        store = get_vector_store()
+        count = store._collection.count()
+        console.print(Panel(
+            f"[bold cyan]Knowledge Base Statistics[/bold cyan]\n\n"
+            f"  Chunks indexed : [bold yellow]{count}[/bold yellow]\n"
+            f"  Collection     : [dim]{store._collection.name}[/dim]\n\n"
+            f"  [dim]Use /doc <file> to add more  •  /rag <question> to search[/dim]",
+            title="📊 RAG Knowledge Base",
+            border_style="cyan",
+            padding=(0, 2),
+        ))
+    except Exception as exc:
+        console.print(f"  ❌ [bold red]Could not read KB stats:[/bold red] {exc}\n")
+    print()
+
+
+def handle_show_models():
+    """Display currently configured models loaded from .env."""
+    import config as _cfg
+    table = Table(title="🤖 Active Model Configuration  (edit .env to change)", box=box.ROUNDED, border_style="cyan")
+    table.add_column("Role",         style="bold green",  no_wrap=True)
+    table.add_column("Model Name",   style="bold yellow")
+    table.add_column("Env Variable", style="dim")
+    table.add_row("Code",      _cfg.CODER_MODEL,         "CODER_MODEL")
+    table.add_row("Main/RAG",  _cfg.MAIN_MODEL,          "MAIN_MODEL")
+    table.add_row("Fast",      _cfg.FAST_MODEL,          "FAST_MODEL")
+    table.add_row("Vision",    _cfg.IMAGE_MODEL,         "IMAGE_MODEL")
+    table.add_row("Embedding", _cfg.RAG_EMBEDDING_MODEL, "RAG_EMBEDDING_MODEL")
+    table.add_row("RAG LLM",   _cfg.RAG_LLM_MODEL,      "RAG_LLM_MODEL")
+    console.print(table)
+    console.print("[dim]  Restart ask.py after editing .env for changes to take effect.[/dim]\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -655,7 +727,7 @@ def handle_history():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    os.makedirs("chat_sessions", exist_ok=True)
+    # Sessions stored only in PostgreSQL — no local JSON or chat_sessions/ folder needed
 
     # ── Initialise PostgreSQL ────────────────────────────────────────────────
     db_ok = db.init_db()
@@ -745,7 +817,34 @@ def main():
                     stage("📎 [Attachment]", f"Attached content from [yellow]{os.path.basename(current_file_path)}[/yellow] to prompt", style="dim")
 
             # ── Command routing ───────────────────────────────────────────────
-            if query.startswith("/complex "):
+            if query.startswith("/rag "):
+                handle_rag(query[5:].strip())
+            elif query.lower() == "/rag":
+                console.print("  [dim]Usage: /rag <question>[/dim]\n")
+            elif query.startswith("/doc "):
+                handle_doc(query[5:].strip())
+            elif query.lower() == "/doc":
+                console.print("  [dim]Usage: /doc <file path>[/dim]\n")
+            elif query.startswith("/img "):
+                rest = query[5:].strip()
+                img_path, q_text = parse_image_command(rest)
+                handle_image(img_path, q_text)
+            elif query.lower() in ["/kb", "/kb-stats", "/kbstats"]:
+                handle_kb_stats()
+            elif query.lower() in ["/models", "/config", "/env"]:
+                handle_show_models()
+            elif query.lower() == "/cancel":
+                current_file_path    = None
+                current_file_content = None
+                stage("🚫 [Cancelled]", "File attachment and active context cleared.", style="bold yellow")
+                print()
+            elif query.lower() in ["/reset", "reset"]:
+                clear_history()
+                current_file_path    = None
+                current_file_content = None
+                stage("🧹 [Memory]", "Conversation context and loaded file cleared!", style="bold green")
+                print()
+            elif query.startswith("/complex "):
                 ask_anything(query[len("/complex "):].strip(), force_multi=True)
             elif query.startswith("/agent "):
                 handle_agent(query[len("/agent "):].strip())

@@ -73,11 +73,12 @@ def load_system_prompt() -> str:
         return "You are a helpful, honest, on-premise AI assistant for industrial/confidential work."
 
 
-# ─── Models (must match `ollama list`) ─────────────────────────────────────────
-CODER_MODEL = "qwen2.5-coder:latest"
-MAIN_MODEL  = "qwen2.5:14b"
-FAST_MODEL  = "qwen2.5:7b"
-IMAGE_MODEL = "qwen2.5vl:7b"
+# ─── Models (read from .env via config.py — swap without touching code) ──────────
+import config as _cfg
+CODER_MODEL = _cfg.CODER_MODEL
+MAIN_MODEL  = _cfg.MAIN_MODEL
+FAST_MODEL  = _cfg.FAST_MODEL
+IMAGE_MODEL = _cfg.IMAGE_MODEL
 
 AVAILABLE_MODELS = {
     "code":    CODER_MODEL,

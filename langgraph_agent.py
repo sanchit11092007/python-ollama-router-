@@ -160,9 +160,11 @@ class AgentState(TypedDict):
 # THE MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 
+import config as _cfg
+
 _llm = ChatOllama(
-    model       = "qwen2.5:14b",
-    base_url    = "http://localhost:11434",
+    model       = _cfg.MAIN_MODEL,
+    base_url    = _cfg.OLLAMA_BASE_URL,
     temperature = 0,
 )
 

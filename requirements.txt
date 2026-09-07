@@ -1,23 +1,36 @@
 # ── Core Agent OTG dependencies ───────────────────────────────────────────────
+python-dotenv          # .env config file support
 fastapi
 uvicorn
 requests
 ollama
 pydantic
-pandas
-openpyxl
-PyMuPDF
-python-docx
+pandas>=2.2
+openpyxl>=3.1
+python-docx>=1.2
 rich
 reportlab
 pdfplumber
 pypdf
 langgraph
-langchain-ollama
 psycopg2-binary
 
-# ── Optional: richer PDF generation (Markdown-aware) ──────────────────────────
-# Install these for styled PDF output with xhtml2pdf:
-#   pip install markdown xhtml2pdf
+# ── LangChain / RAG stack ─────────────────────────────────────────────────────
+langchain>=0.3
+langchain-core>=0.3
+langchain-ollama>=0.2
+langchain-chroma>=0.1
+langchain-community>=0.3
+langchain-text-splitters>=0.3
+chromadb>=0.5
+
+# ── Document loaders ──────────────────────────────────────────────────────────
+PyMuPDF>=1.24          # used by langchain_community.document_loaders.PyMuPDFLoader
+docx2txt               # used by langchain_community.document_loaders.Docx2txtLoader
+
+# ── PDF generation (Markdown-aware) ───────────────────────────────────────────
 markdown
 xhtml2pdf
+
+# ── Optional: semantic splitting (only needed if RAG_ENABLE_SEMANTIC_SPLITTER=true)
+# langchain-experimental

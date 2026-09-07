@@ -210,14 +210,20 @@ class ImageQuestion(BaseModel):
 
 @app.get("/")
 def home():
+    import config as _cfg
     log_system("Client requested server status page /")
     return {
-        "status": "online",
-        "models": AVAILABLE_MODELS,
+        "agent":       _cfg.APP_NAME,
+        "version":     _cfg.APP_VERSION,
+        "made_by":     _cfg.APP_TEAM,
+        "description": "100% On-Premise • Air-Gapped • No cloud • No tracking",
+        "status":      "online",
+        "models":      AVAILABLE_MODELS,
         "endpoints": [
             "/ask", "/ask/stream", "/ask/complex",
             "/ask/image", "/ask/agent",
-            "/reset", "/health", "/docs",
+            "/reset", "/health", "/tools",
+            "/sessions", "/docs",
         ],
     }
 
