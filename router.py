@@ -21,23 +21,39 @@ HOW A QUESTION FLOWS
 
 MEMORY
     HISTORY is a shared list of past turns, used so follow-up questions
-    have context. Fine for a single-user hackathon demo.
+    have context. Fine for a single-user local demo.
+
+SESSION PERSISTENCE
+    All messages are stored in PostgreSQL (agent_otg database) via db.py.
+    Configure credentials in db_config.json.
 """
 
 import json
 import os
 import ollama
 
-_CURRENT_SESSION_FILE = None
+import db as _db
+
+_CURRENT_SESSION_NAME: str = ""
 _LOG_CALLBACK = None
 
-def start_new_session(filepath: str):
-    global _CURRENT_SESSION_FILE
-    _CURRENT_SESSION_FILE = filepath
+
+def start_new_session(session_name: str):
+    """
+    Called at startup to name the current session.
+    Creates the session record in PostgreSQL.
+    The session_name is a human-readable string (e.g. 'session_2026-09-07_10-30-00').
+    """
+    global _CURRENT_SESSION_NAME
+    _CURRENT_SESSION_NAME = session_name
+    if _db.is_ready():
+        _db.create_session(session_name)
+
 
 def set_log_callback(cb):
     global _LOG_CALLBACK
     _LOG_CALLBACK = cb
+
 
 def _log_event(event_type: str, data: dict):
     if _LOG_CALLBACK:
@@ -46,21 +62,22 @@ def _log_event(event_type: str, data: dict):
         except Exception:
             pass
 
+
 def load_system_prompt() -> str:
-    """Anyone (including non-developers) can edit system_prompt.txt to change behavior."""
+    """Load the shared system prompt from disk (relative to this file)."""
+    prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.txt")
     try:
-        with open("system_prompt.txt", "r", encoding="utf-8") as f:
+        with open(prompt_path, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
-        print("[Warning] system_prompt.txt not found! Using hardcoded default.")
         return "You are a helpful, honest, on-premise AI assistant for industrial/confidential work."
 
 
-# ─── Models (must match `ollama list` on your machine) ─────────────────
+# ─── Models (must match `ollama list`) ─────────────────────────────────────────
 CODER_MODEL = "qwen2.5-coder:latest"
 MAIN_MODEL  = "qwen2.5:14b"
 FAST_MODEL  = "qwen2.5:7b"
-IMAGE_MODEL = "qwen2.5vl:7b"   # vision model - handles image + text queries
+IMAGE_MODEL = "qwen2.5vl:7b"
 
 AVAILABLE_MODELS = {
     "code":    CODER_MODEL,
@@ -69,36 +86,22 @@ AVAILABLE_MODELS = {
     "image":   IMAGE_MODEL,
 }
 
-# ─── Conversation memory ────────────────────────────────────────────────
+# ─── Conversation memory ────────────────────────────────────────────────────────
 HISTORY   = []
 MAX_TURNS = 12
 
 
 def add_to_history(role: str, content: str):
     HISTORY.append({"role": role, "content": content})
-    del HISTORY[:-MAX_TURNS]
-    
-    if _CURRENT_SESSION_FILE:
-        try:
-            session_data = []
-            if os.path.isfile(_CURRENT_SESSION_FILE):
-                with open(_CURRENT_SESSION_FILE, "r", encoding="utf-8") as f:
-                    try:
-                        session_data = json.load(f)
-                    except json.JSONDecodeError:
-                        pass
-            
-            import time
-            session_data.append({
-                "role": role, 
-                "content": content, 
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-            })
-            
-            with open(_CURRENT_SESSION_FILE, "w", encoding="utf-8") as f:
-                json.dump(session_data, f, indent=2)
-        except Exception as e:
-            print(f"[Error saving session]: {e}")
+    # Trim to keep only the last MAX_TURNS entries
+    if len(HISTORY) > MAX_TURNS:
+        del HISTORY[:len(HISTORY) - MAX_TURNS]
+
+    # Persist to PostgreSQL
+    if _CURRENT_SESSION_NAME and _db.is_ready():
+        ok = _db.save_message(_CURRENT_SESSION_NAME, role, content)
+        if not ok:
+            print(f"[router] DB save failed for role={role} — message not persisted", flush=True)
 
 
 def get_history() -> list:
@@ -109,15 +112,15 @@ def clear_history():
     HISTORY.clear()
 
 
-# ══════════════════════════════════════════════════════════════════
-# STEP 1: Classify - which category, and is it actually multiple asks?
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# Classify — which category, and is it multiple asks?
+# ══════════════════════════════════════════════════════════════════════════════
 
 CLASSIFY_PROMPT = """You are a routing assistant. Read the user's new question
 (and the short recent chat history, if any) and decide:
 
 1. category: ONE of
-   - "code"    -> writing, fixing, explaining, or debugging code/scripts
+   - "code"    -> writing, fixing, debugging, testing, or explaining code/scripts/SQL/functions
    - "simple"  -> quick factual questions, greetings, small talk, easy one-line math
    - "complex" -> anything needing real reasoning, explanation, essay writing, or multi-step thought
 2. is_multi_part: true if the message asks for TWO OR MORE clearly distinct things
@@ -134,34 +137,32 @@ Reply with ONLY this JSON, nothing else:
 {"category": "code" | "simple" | "complex", "is_multi_part": true | false, "has_code_and_explain": true | false, "reason": "one short sentence"}
 """
 
-# Keywords that signal "please also explain the code"
 _EXPLAIN_KEYWORDS = [
     "explain", "walk me through", "walk through", "how it works",
     "step by step", "step-by-step", "break it down", "describe",
-    "elaborate", "detail", "breakdown",
+    "elaborate", "detail", "breakdown", "walkthrough",
 ]
-
-# Keywords that signal "please write code"
 _CODE_KEYWORDS = [
     "code", "script", "function", "program", "write", "build",
-    "implement", "create", "generate",
+    "implement", "create", "generate", "debug", "fix", "bug",
+    "test", "class", "method", "api", "sql", "query", "python",
+    "javascript", "typescript", "java", "c++", "rust", "go",
 ]
 
 
 def _looks_like_code_and_explain(query: str) -> bool:
-    """
-    Keyword safety-net: returns True when the query wants BOTH code AND
-    an explanation of that code. Used as a fallback / extra check.
-    """
     q = query.lower()
-    has_code    = any(k in q for k in _CODE_KEYWORDS)
-    has_explain = any(k in q for k in _EXPLAIN_KEYWORDS)
-    return has_code and has_explain
+    return any(k in q for k in _CODE_KEYWORDS) and any(k in q for k in _EXPLAIN_KEYWORDS)
 
 
 def classify_question(query: str) -> dict:
     recent       = HISTORY[-4:]
     context_text = "\n".join(f"{m['role']}: {m['content']}" for m in recent)
+
+    category         = "complex"
+    is_multi_part    = False
+    has_code_explain = False
+    reason           = ""
 
     try:
         response = ollama.chat(
@@ -173,24 +174,30 @@ def classify_question(query: str) -> dict:
             format="json",
             options={"temperature": 0},
         )
-        result           = json.loads(response["message"]["content"])
+        raw = response["message"]["content"] if isinstance(response, dict) else response.message.content
+        result           = json.loads(raw)
         category         = result.get("category", "complex")
         is_multi_part    = bool(result.get("is_multi_part", False))
         has_code_explain = bool(result.get("has_code_and_explain", False))
         reason           = result.get("reason", "")
 
-        # Extra safety net: even if the model missed it, keyword check catches it
         if not has_code_explain and _looks_like_code_and_explain(query):
             has_code_explain = True
-            is_multi_part    = True
 
     except Exception:
-        category         = "code" if any(
-            k in query.lower() for k in ["code", "python", "function", "bug", "error", "script", "sql"]
-        ) else "complex"
+        # Fallback: keyword-based classification
+        q_lower = query.lower()
+        if any(k in q_lower for k in ["code", "python", "function", "bug", "error", "script", "sql", "debug", "fix", "class"]):
+            category = "code"
+        else:
+            category = "complex"
         has_code_explain = _looks_like_code_and_explain(query)
-        is_multi_part    = has_code_explain or " and " in query.lower()
+        is_multi_part    = has_code_explain or (" and " in q_lower and len(query) > 40)
         reason           = "fallback keyword match (model reply was not valid JSON)"
+
+    # Validate category
+    if category not in AVAILABLE_MODELS:
+        category = "complex"
 
     result_data = {
         "category":             category,
@@ -207,14 +214,9 @@ def pick_model(category: str) -> str:
     return AVAILABLE_MODELS.get(category, MAIN_MODEL)
 
 
-# ══════════════════════════════════════════════════════════════════
-# STEP 2: Run a model on a single task (with memory)
-# ══════════════════════════════════════════════════════════════════
-
-def _build_messages(query: str) -> list:
-    sys_prompt = load_system_prompt()
-    return [{"role": "system", "content": sys_prompt}] + HISTORY + [{"role": "user", "content": query}]
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers to safely read fields from ollama response (dict or object)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _get(obj, *keys, default=None):
     """Safely get nested attribute/key from ollama response objects or dicts."""
@@ -228,36 +230,77 @@ def _get(obj, *keys, default=None):
     return obj if obj is not None else default
 
 
+def _msg_to_dict(msg) -> dict:
+    """Normalise an ollama message (could be dict or object) to a plain dict."""
+    if isinstance(msg, dict):
+        return msg
+    d = {
+        "role":    getattr(msg, "role", "assistant"),
+        "content": getattr(msg, "content", "") or "",
+    }
+    tc = getattr(msg, "tool_calls", None)
+    if tc:
+        d["tool_calls"] = tc
+    return d
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Run a model on a single task (with memory)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_messages(query: str) -> list:
+    sys_prompt = load_system_prompt()
+    return [{"role": "system", "content": sys_prompt}] + HISTORY + [{"role": "user", "content": query}]
+
+
 def get_full_answer(model: str, query: str) -> str:
     from tools import TOOL_SCHEMAS, TOOL_FUNCTIONS
     _log_event("model_start", {"model": model, "query": query})
     messages = _build_messages(query)
 
-    response = ollama.chat(model=model, messages=messages, tools=TOOL_SCHEMAS)
+    # First call — may produce tool_calls
+    try:
+        response   = ollama.chat(model=model, messages=messages, tools=TOOL_SCHEMAS)
+    except Exception as exc:
+        _log_event("model_done", {"model": model, "answer": f"[Error] {exc}"})
+        err_msg = f"Error calling model '{model}': {exc}"
+        add_to_history("user", query)
+        add_to_history("assistant", err_msg)
+        return err_msg
 
     tool_calls = _get(response, "message", "tool_calls") or []
+
     if tool_calls:
-        messages.append(response["message"] if isinstance(response, dict) else {
-            "role": "assistant",
-            "content": _get(response, "message", "content") or "",
-            "tool_calls": tool_calls,
-        })
+        messages.append(_msg_to_dict(_get(response, "message")))
+
         for tool_call in tool_calls:
             func_name = _get(tool_call, "function", "name")
-            args = _get(tool_call, "function", "arguments") or {}
+            args      = _get(tool_call, "function", "arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
 
             if func_name in TOOL_FUNCTIONS:
                 try:
                     result = TOOL_FUNCTIONS[func_name](**args)
                 except Exception as e:
-                    result = f"Error: {e}"
+                    result = f"Error running tool '{func_name}': {e}"
             else:
-                result = f"Error: Function {func_name} not found"
+                result = f"Error: tool '{func_name}' not registered."
 
             _log_event("tool_call", {"tool": func_name, "args": args, "result": str(result)})
             messages.append({"role": "tool", "content": str(result)})
 
-        response = ollama.chat(model=model, messages=messages)
+        # Second call — generate natural language response with tool results in context
+        try:
+            response = ollama.chat(model=model, messages=messages)
+        except Exception as exc:
+            answer = f"Tools executed. Error generating follow-up: {exc}"
+            add_to_history("user", query)
+            add_to_history("assistant", answer)
+            return answer
 
     answer = _get(response, "message", "content") or ""
 
@@ -273,74 +316,94 @@ def stream_answer(model: str, query: str):
     messages    = _build_messages(query)
     full_answer = ""
 
-    response_msg = {"role": "assistant", "content": ""}
-    tool_calls = []
+    response_msg: dict = {"role": "assistant", "content": ""}
+    tool_calls:   list = []
 
-    for chunk in ollama.chat(model=model, messages=messages, stream=True, tools=TOOL_SCHEMAS):
-        chunk_tool_calls = _get(chunk, "message", "tool_calls") or []
-        if chunk_tool_calls:
-            tool_calls.extend(chunk_tool_calls)
+    # Stream first response
+    try:
+        for chunk in ollama.chat(model=model, messages=messages, stream=True, tools=TOOL_SCHEMAS):
+            chunk_tcs = _get(chunk, "message", "tool_calls") or []
+            if chunk_tcs:
+                tool_calls.extend(chunk_tcs)
 
-        token = _get(chunk, "message", "content") or ""
-        if token:
-            full_answer += token
-            response_msg["content"] += token
-            yield token
+            token = _get(chunk, "message", "content") or ""
+            if token:
+                full_answer += token
+                response_msg["content"] += token
+                yield token
+    except Exception as exc:
+        err = f"\n[Error during streaming: {exc}]"
+        yield err
+        full_answer += err
+        add_to_history("user", query)
+        add_to_history("assistant", full_answer)
+        _log_event("stream_done", {"model": model, "answer": full_answer})
+        return
 
+    # If tools were called, execute them and stream the follow-up
     if tool_calls:
         response_msg["tool_calls"] = tool_calls
         messages.append(response_msg)
 
         for tool_call in tool_calls:
             func_name = _get(tool_call, "function", "name")
-            args = _get(tool_call, "function", "arguments") or {}
+            args      = _get(tool_call, "function", "arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+
             yield f"\n\n[System: Calling tool '{func_name}'...]\n"
 
             if func_name in TOOL_FUNCTIONS:
                 try:
                     result = TOOL_FUNCTIONS[func_name](**args)
                 except Exception as e:
-                    result = f"Error: {e}"
+                    result = f"Error running tool '{func_name}': {e}"
             else:
-                result = f"Error: Function {func_name} not found"
+                result = f"Error: tool '{func_name}' not registered."
 
             _log_event("tool_call", {"tool": func_name, "args": args, "result": str(result)})
             messages.append({"role": "tool", "content": str(result)})
 
-        for chunk in ollama.chat(model=model, messages=messages, stream=True):
-            token = _get(chunk, "message", "content") or ""
-            if token:
-                full_answer += token
-                yield token
+        yield "\n"
+        # Stream follow-up response (no tools= here — just natural language)
+        try:
+            for chunk in ollama.chat(model=model, messages=messages, stream=True):
+                token = _get(chunk, "message", "content") or ""
+                if token:
+                    full_answer += token
+                    yield token
+        except Exception as exc:
+            err = f"\n[Error in follow-up stream: {exc}]"
+            yield err
+            full_answer += err
 
     add_to_history("user",      query)
     add_to_history("assistant", full_answer)
     _log_event("stream_done", {"model": model, "answer": full_answer})
 
 
-# ══════════════════════════════════════════════════════════════════
-# IMAGE: Send an image + question to the vision model
-#
-#  image_b64 is a raw base64 string (no data-URI prefix).
-#  Both functions mirror get_full_answer / stream_answer in style.
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# IMAGE: vision model
+# ══════════════════════════════════════════════════════════════════════════════
 
 def ask_image(image_b64: str, query: str) -> str:
-    """
-    Send an image + question to IMAGE_MODEL, return the full answer.
-    image_b64 must be a plain base64-encoded string (PNG / JPEG).
-    """
     _log_event("image_start", {"model": IMAGE_MODEL, "query": query, "image_size_b64": len(image_b64)})
-    response = ollama.chat(
-        model=IMAGE_MODEL,
-        messages=[{
-            "role":    "user",
-            "content": query,
-            "images":  [image_b64],   # ollama accepts raw base64 here
-        }],
-    )
-    answer = response["message"]["content"]
-    # Save to shared history so follow-up text questions have context
+    try:
+        response = ollama.chat(
+            model=IMAGE_MODEL,
+            messages=[{
+                "role":    "user",
+                "content": query,
+                "images":  [image_b64],
+            }],
+        )
+        answer = _get(response, "message", "content") or ""
+    except Exception as exc:
+        answer = f"Error analyzing image: {exc}"
+
     add_to_history("user",      f"[image attached] {query}")
     add_to_history("assistant", answer)
     _log_event("image_done", {"model": IMAGE_MODEL, "answer": answer})
@@ -348,52 +411,40 @@ def ask_image(image_b64: str, query: str) -> str:
 
 
 def stream_image_answer(image_b64: str, query: str):
-    """
-    Same as ask_image but streams tokens one by one.
-    image_b64 must be a plain base64-encoded string (PNG / JPEG).
-    """
     _log_event("image_start", {"model": IMAGE_MODEL, "query": query, "image_size_b64": len(image_b64)})
     full_answer = ""
-    for chunk in ollama.chat(
-        model=IMAGE_MODEL,
-        messages=[{
-            "role":    "user",
-            "content": query,
-            "images":  [image_b64],
-        }],
-        stream=True,
-    ):
-        token        = chunk["message"]["content"]
-        full_answer += token
-        yield token
+    try:
+        for chunk in ollama.chat(
+            model=IMAGE_MODEL,
+            messages=[{
+                "role":    "user",
+                "content": query,
+                "images":  [image_b64],
+            }],
+            stream=True,
+        ):
+            token = _get(chunk, "message", "content") or ""
+            if token:
+                full_answer += token
+                yield token
+    except Exception as exc:
+        err = f"[Error: {exc}]"
+        full_answer += err
+        yield err
 
     add_to_history("user",      f"[image attached] {query}")
     add_to_history("assistant", full_answer)
     _log_event("image_done", {"model": IMAGE_MODEL, "answer": full_answer})
 
 
-# ══════════════════════════════════════════════════════════════════
-# STEP 3a: Sequential pipeline for "code + explain" requests
-#
-#  Step 1 -> CODER_MODEL writes the code, saved to shared HISTORY.
-#  Step 2 -> MAIN_MODEL reads the history and writes the explanation.
-#            It naturally "sees" the code without us repeating it.
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# Sequential pipeline: "code + explain" in two ordered steps
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_sequential_tasks(query: str) -> list:
-    """
-    Handles "give me code AND explain how it works" in two ordered steps.
-
-    Returns a list of result dicts, one per step:
-      - step        : step number (1 or 2)
-      - label       : short human-readable title
-      - model_used  : which model ran this step
-      - category    : "code" or "complex"
-      - answer      : the model's response text
-    """
     results = []
 
-    # ── Step 1: Coder model writes the code ────────────────────────
+    # Step 1: Code
     code_prompt = (
         f"The user asked: \"{query}\"\n\n"
         "Your job for this step: write ONLY the code. "
@@ -408,9 +459,7 @@ def run_sequential_tasks(query: str) -> list:
         "answer":     code_answer,
     })
 
-    # ── Step 2: Main model explains the code ───────────────────────
-    # HISTORY already contains the code from Step 1, so MAIN_MODEL
-    # can refer to it directly — no need to copy-paste the code here.
+    # Step 2: Explain (MAIN_MODEL sees the code already in shared HISTORY)
     explain_prompt = (
         "Now explain the code you just wrote above, step by step. "
         "Be clear and beginner-friendly. Cover what each part does and why."
@@ -427,18 +476,13 @@ def run_sequential_tasks(query: str) -> list:
     return results
 
 
-# ══════════════════════════════════════════════════════════════════
-# STEP 3b: Split a multi-part question, each part -> its own model
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# Split a multi-part question into independent sub-tasks
+# ══════════════════════════════════════════════════════════════════════════════
 
 def break_into_tasks(query: str) -> list:
-    """
-    "Write an essay on Programming and give me 10 code snippets"
-    -> [ {label: "Essay on Programming", task: "...", model: MAIN_MODEL},
-         {label: "10 code snippets",     task: "...", model: CODER_MODEL} ]
-    """
     prompt = f"""The user's message contains MULTIPLE distinct requests bundled together.
-Split it into separate, self-contained tasks - do NOT merge them back into one.
+Split it into separate, self-contained tasks — do NOT merge them back into one.
 Each task's "task" field must be a full standalone instruction (repeat any shared
 context so each task makes sense on its own).
 
@@ -456,25 +500,37 @@ Message: {query}
             format="json",
             options={"temperature": 0},
         )
-        raw = json.loads(response["message"]["content"])
+        raw_content = response["message"]["content"] if isinstance(response, dict) else response.message.content
+        raw = json.loads(raw_content)
 
-        # Some models wrap the list in a dict like {"tasks": [...]}. Handle both.
+        # Model may wrap the list in {"tasks": [...]}
         raw_tasks = raw.get("tasks", raw) if isinstance(raw, dict) else raw
 
-        tasks = [
-            {
-                "label":    t["label"],
-                "task":     t["task"],
-                "category": t.get("category", "complex"),
-                "model":    pick_model(t.get("category", "complex")),
-            }
-            for t in raw_tasks
-        ]
+        if not isinstance(raw_tasks, list):
+            raise ValueError("Response is not a list")
+
+        tasks = []
+        for t in raw_tasks:
+            if not isinstance(t, dict):
+                continue
+            label    = str(t.get("label", "Sub-task")).strip() or "Sub-task"
+            task_str = str(t.get("task", query)).strip() or query
+            category = str(t.get("category", "complex")).strip()
+            if category not in AVAILABLE_MODELS:
+                category = "complex"
+            tasks.append({
+                "label":    label,
+                "task":     task_str,
+                "category": category,
+                "model":    pick_model(category),
+            })
+
         if len(tasks) >= 2:
             return tasks
+
     except Exception:
         pass
 
-    # Fallback: couldn't split cleanly -> treat as one task
+    # Fallback: treat as a single task
     info = classify_question(query)
     return [{"label": "Full request", "task": query, "category": info["category"], "model": info["model"]}]

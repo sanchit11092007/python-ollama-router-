@@ -27,3 +27,6 @@ chroma_db/
 
 # Chat session logs (personal data, not source code)
 chat_sessions/
+
+# PostgreSQL credentials — NEVER commit this file
+db_config.json

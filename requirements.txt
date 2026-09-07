@@ -12,6 +12,12 @@ rich
 reportlab
 pdfplumber
 pypdf
-chromadb
 langgraph
 langchain-ollama
+psycopg2-binary
+
+# ── Optional: richer PDF generation (Markdown-aware) ──────────────────────────
+# Install these for styled PDF output with xhtml2pdf:
+#   pip install markdown xhtml2pdf
+markdown
+xhtml2pdf

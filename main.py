@@ -39,6 +39,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import db
 import router
 from router import (
     classify_question,
@@ -132,14 +133,19 @@ router.set_log_callback(_router_event_listener)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    os.makedirs("chat_sessions", exist_ok=True)
-    session_file = os.path.join(
-        "chat_sessions",
-        datetime.datetime.now().strftime("server_session_%Y-%m-%d_%H-%M-%S.json")
-    )
-    router.start_new_session(session_file)
+    # ── Initialise PostgreSQL ───────────────────────────────────────────────
+    db_ok = db.init_db()
+    if db_ok:
+        log_system("PostgreSQL session store: connected OK")
+    else:
+        log_err(f"PostgreSQL session store: UNAVAILABLE — {db.get_error()}")
+        log_system("Sessions will NOT be persisted. Check db_config.json.")
+
+    # ── Session name ────────────────────────────────────────────────────
+    session_name = datetime.datetime.now().strftime("server_session_%Y-%m-%d_%H-%M-%S")
+    router.start_new_session(session_name)
     log_system("Agent OTG FastAPI Server Started")
-    log_system(f"Active Session File: {session_file}")
+    log_system(f"Active Session: {session_name}")
     log_system(f"Configured Models: {AVAILABLE_MODELS}")
     yield
     log_system("Agent OTG FastAPI Server Stopping...")
@@ -505,10 +511,11 @@ def ask_image_endpoint(q: ImageQuestion):
 def ask_agent(q: Question):
     """
     LangGraph agent endpoint.
-    Runs the question through a structured 3-node graph:
+    Runs the question through a structured multi-turn graph:
       1. classify  — decides if a tool is needed and which one
       2. tools     — executes the real tool from tools.py (if needed)
-      3. respond   — generates the final answer with full context
+      3. classify  — loops back to check if more tools needed (up to 5x)
+      4. respond   — generates the final answer with full context
     """
     try:
         start = time.time()
@@ -524,28 +531,87 @@ def ask_agent(q: Question):
             )
 
         history = get_history()
-        log_model("Running LangGraph agent (Node pipeline: classify -> tools? -> respond)...")
+        log_model("Running LangGraph agent (Node pipeline: classify -> tools? -> classify -> ... -> respond)...")
         result = run_agent(q.query, history=history)
 
-        if result.get("needs_tool"):
-            for t in result.get("tool_log", []):
-                log_tool(f"Agent tool executed: {t.get('tool')} with {t.get('args')} -> {str(t.get('result'))[:120]}")
+        needs_tool = result.get("needs_tool", False)
+        tool_log   = result.get("tool_log", [])
+        answer     = result.get("final_answer", "").strip()
+
+        if needs_tool and tool_log:
+            for t in tool_log:
+                log_tool(f"Agent tool: {t.get('tool')} -> {str(t.get('result', ''))[:120]}")
         else:
             log_model("Agent decided: direct response (no tool needed)")
 
+        if not answer:
+            answer = "Agent completed. Check generated_files/ for any output files."
+
         elapsed = round(time.time() - start, 2)
-        log_response(f"LangGraph agent completed in {elapsed}s")
+        log_response(f"LangGraph agent completed in {elapsed}s | tools_called={len(tool_log)}")
 
         return {
             "type":         "agent",
             "model_used":   "qwen2.5:14b (LangGraph)",
             "time_seconds": elapsed,
-            "needs_tool":   result["needs_tool"],
-            "tool_log":     result["tool_log"],
-            "answer":       result["final_answer"],
+            "needs_tool":   needs_tool,
+            "tool_log":     tool_log,
+            "answer":       answer,
         }
     except HTTPException:
         raise
     except Exception as e:
         log_err(f"Exception in /ask/agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tools")
+def list_tools():
+    """List all tools available to the LangGraph agent."""
+    from tools import TOOL_SCHEMAS
+    return {
+        "tools": [
+            {
+                "name":        t["function"]["name"],
+                "description": t["function"]["description"],
+                "required":    t["function"]["parameters"].get("required", []),
+            }
+            for t in TOOL_SCHEMAS
+        ]
+    }
+
+
+@app.get("/sessions")
+def list_sessions():
+    """List all saved chat sessions stored in PostgreSQL."""
+    if not db.is_ready():
+        raise HTTPException(
+            status_code=503,
+            detail=f"PostgreSQL unavailable: {db.get_error()}"
+        )
+    sessions = db.get_all_sessions(limit=50)
+    return {
+        "total":    db.get_session_count(),
+        "sessions": sessions,
+    }
+
+
+@app.get("/sessions/{session_name}")
+def get_session_messages(session_name: str):
+    """Retrieve all messages for a specific session from PostgreSQL."""
+    if not db.is_ready():
+        raise HTTPException(
+            status_code=503,
+            detail=f"PostgreSQL unavailable: {db.get_error()}"
+        )
+    messages = db.get_session_messages(session_name, limit=500)
+    if not messages:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{session_name}' not found or has no messages."
+        )
+    return {
+        "session_name": session_name,
+        "message_count": len(messages),
+        "messages": messages,
+    }

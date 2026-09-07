@@ -10,33 +10,66 @@ def convert_excel_to_json(file_path: str, sheet_name=0) -> str:
     if not os.path.exists(file_path):
         return f"Error: file not found at {file_path}"
 
-    df = pd.read_excel(file_path, sheet_name=sheet_name)
-    df = df.where(pd.notnull(df), None)
-    json_data = df.to_json(orient="records", date_format="iso", force_ascii=False)
-    parsed = json.loads(json_data)
-    return json.dumps(parsed, indent=2)
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name)
+        df = df.where(pd.notnull(df), None)
+        json_data = df.to_json(orient="records", date_format="iso", force_ascii=False)
+        parsed = json.loads(json_data)
+        return json.dumps(parsed, indent=2)
+    except Exception as exc:
+        return f"Error reading Excel file: {exc}"
 
 
-def convert_pdf_to_json(file_path: str) -> str:
-    """Extracts text from a PDF, page by page, as structured JSON."""
+def convert_pdf_to_text(file_path: str) -> str:
+    """
+    Extracts text from a PDF page by page and returns flat plain text.
+    This is the preferred format for LLM context injection.
+    """
     if not os.path.exists(file_path):
         return f"Error: file not found at {file_path}"
 
-    doc = fitz.open(file_path)
-    document_data = {
-        "metadata": doc.metadata,
-        "total_pages": len(doc),
-        "pages": [],
-    }
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        text = page.get_text("text").strip()
-        document_data["pages"].append({
-            "page_number": page_num + 1,
-            "content": text if text else None,
-        })
-    doc.close()
-    return json.dumps(document_data, indent=2, ensure_ascii=False)
+    try:
+        doc = fitz.open(file_path)
+        pages = []
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            text = page.get_text("text").strip()
+            if text:
+                pages.append(f"[Page {page_num + 1}]\n{text}")
+        doc.close()
+        if not pages:
+            return "No extractable text found in this PDF."
+        return "\n\n".join(pages)
+    except Exception as exc:
+        return f"Error reading PDF: {exc}"
+
+
+# Keep the old JSON version for backwards compatibility (used by tools.py)
+def convert_pdf_to_json(file_path: str) -> str:
+    """
+    Extracts text from a PDF, page by page, as structured JSON.
+    NOTE: For LLM prompts, prefer convert_pdf_to_text() for flatter output.
+    """
+    if not os.path.exists(file_path):
+        return f"Error: file not found at {file_path}"
+
+    try:
+        doc = fitz.open(file_path)
+        document_data = {
+            "total_pages": len(doc),
+            "pages": [],
+        }
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            text = page.get_text("text").strip()
+            document_data["pages"].append({
+                "page_number": page_num + 1,
+                "content": text if text else None,
+            })
+        doc.close()
+        return json.dumps(document_data, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        return f"Error reading PDF: {exc}"
 
 
 def process_word(file_path: str) -> str:
@@ -44,8 +77,11 @@ def process_word(file_path: str) -> str:
     if not os.path.exists(file_path):
         return f"Error: file not found at {file_path}"
 
-    doc = Document(file_path)
-    return "\n".join(paragraph.text for paragraph in doc.paragraphs)
+    try:
+        doc = Document(file_path)
+        return "\n".join(paragraph.text for paragraph in doc.paragraphs)
+    except Exception as exc:
+        return f"Error reading Word document: {exc}"
 
 
 def _clean_path(path: str) -> str:
@@ -60,7 +96,7 @@ def _clean_path(path: str) -> str:
 def process_file(file_path: str) -> str:
     """
     Looks at a file's extension and reads it with the right function above.
-    Returns plain text/JSON that can be handed to any of your AI models.
+    Returns plain text/JSON that can be handed to any of the AI models.
     """
     file_path = _clean_path(file_path)
     if not os.path.exists(file_path):
@@ -73,6 +109,7 @@ def process_file(file_path: str) -> str:
     elif extension.endswith(".docx"):
         return process_word(file_path)
     elif extension.endswith(".pdf"):
-        return convert_pdf_to_json(file_path)
+        # Use flat text extraction for LLM context (better than JSON blob)
+        return convert_pdf_to_text(file_path)
     else:
-        return f"Error: unsupported file type for {file_path}"
+        return f"Error: unsupported file type for {file_path}. Supported: .xlsx, .xls, .docx, .pdf"

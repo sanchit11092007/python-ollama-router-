@@ -10,12 +10,6 @@ HOW IT FITS IN:
   - ask.py  exposes a  /agent <query>   terminal command that calls run_agent()
   - router.py, tools.py, and all other existing files are untouched in design.
 
-WHAT THIS ADDS OVER PLAIN router.py:
-  - Structured multi-step reasoning graph (not just model routing)
-  - Explicit tool-calling loop: the model can call multiple real tools in sequence
-  - Clear node-level visibility: each step is labelled and traceable
-  - Retry-capable architecture: easy to add retry edges later
-
 HOW THE GRAPH WORKS:
   [START]
       |
@@ -33,6 +27,8 @@ HOW THE GRAPH WORKS:
        |  tools  |      |
        +--------+       |
             |           |
+        [loop back to classify up to MAX_TOOL_ITERATIONS times]
+            |           |
             +-----------+
                   |
                   v
@@ -41,36 +37,37 @@ HOW THE GRAPH WORKS:
            +---------+
                   |
                  END
+
+MULTI-TOOL LOOP:
+  After executing a tool, the agent re-enters classify to check
+  if another tool is needed, up to MAX_TOOL_ITERATIONS times.
+  This allows chained operations like: generate PDF → get page count.
 """
 
 import os
-
-# ── Telemetry / analytics OFF — must be set BEFORE any langchain/langgraph import.
-#
-# WHY THESE LINES EXIST AND MUST NEVER BE REMOVED:
-#   This project is fully offline and sovereign — no queries, usage stats,
-#   or telemetry of any kind should leave the machine.
-#   LangChain/LangSmith and LangGraph try to phone home by default.
-#   These three env vars are the official switch to disable all of that.
-os.environ["LANGCHAIN_TRACING_V2"]       = "false"   # disables LangSmith tracing
-os.environ["LANGGRAPH_CLI_NO_ANALYTICS"] = "1"       # disables LangGraph CLI telemetry
-os.environ["ANONYMIZED_TELEMETRY"]       = "false"   # disables chromadb / other anon stats
-
-# ── Standard library ──────────────────────────────────────────────────────────
+import sys
 import json
+import re
 from typing import Literal, TypedDict, Annotated
 import operator
 
-# ── LangGraph / LangChain ─────────────────────────────────────────────────────
+# ── Telemetry / analytics OFF ─────────────────────────────────────────────────
+os.environ["LANGCHAIN_TRACING_V2"]       = "false"
+os.environ["LANGGRAPH_CLI_NO_ANALYTICS"] = "1"
+os.environ["ANONYMIZED_TELEMETRY"]       = "false"
+
 from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from langgraph.graph import StateGraph, END
 
-# ── Real tools from this project ──────────────────────────────────────────────
-# We import the actual TOOL_FUNCTIONS and TOOL_SCHEMAS from tools.py so the
-# LangGraph agent can call write_docx, generate_pdf_from_text, search_documents, etc.
 from tools import TOOL_FUNCTIONS, TOOL_SCHEMAS
+
+# Maximum tool calls per agent invocation (prevents infinite loops)
+MAX_TOOL_ITERATIONS = 5
+
+# ── Script directory for resolving relative paths ─────────────────────────────
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -78,9 +75,10 @@ from tools import TOOL_FUNCTIONS, TOOL_SCHEMAS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _load_system_prompt() -> str:
-    """Read the shared system_prompt.txt — same file router.py uses."""
+    """Load system prompt from disk, relative to this file's directory."""
+    prompt_path = os.path.join(_SCRIPT_DIR, "system_prompt.txt")
     try:
-        with open("system_prompt.txt", "r", encoding="utf-8") as f:
+        with open(prompt_path, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
         return "You are a helpful, honest, on-premise AI assistant."
@@ -88,9 +86,8 @@ def _load_system_prompt() -> str:
 
 def _history_to_lc_messages(history: list) -> list:
     """
-    Convert the HISTORY list from router.py (list of {role, content} dicts)
-    into LangChain message objects that ChatOllama understands.
-    Only the last 6 turns are included to keep context short and fast.
+    Convert router.py HISTORY (list of {role, content} dicts) into
+    LangChain message objects. Only the last 6 turns are included.
     """
     messages = []
     for turn in history[-6:]:
@@ -103,27 +100,64 @@ def _history_to_lc_messages(history: list) -> list:
     return messages
 
 
+def _extract_json_from_response(raw: str) -> dict:
+    """
+    Robustly extract a JSON object from an LLM response.
+    Handles:
+      - Plain JSON
+      - ```json ... ``` fences
+      - ```...``` fences without language tag
+      - JSON embedded mid-text (finds the first { ... } block)
+    """
+    text = raw.strip()
+
+    # Strip markdown fences (```json ... ``` or ``` ... ```)
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```\s*$", "", text)
+    text = text.strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: find the first { ... } block
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"No valid JSON found in response: {raw[:200]}")
+
+
+def _tool_summary() -> str:
+    """Build a human-readable tool list from TOOL_SCHEMAS."""
+    return "\n".join(
+        f"  - {s['function']['name']}: {s['function']['description']}"
+        for s in TOOL_SCHEMAS
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SHARED STATE
-# Each field below is passed from node to node as the graph runs.
-# Annotated[list, operator.add] means: when two nodes both write to "tool_log",
-# LangGraph appends the lists together instead of overwriting. For all other
-# fields it simply overwrites with the latest value.
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AgentState(TypedDict):
-    question:    str                               # original user question, never changes
-    history:     list                              # conversation turns from router.HISTORY
-    needs_tool:  bool                              # did classify node decide a tool is needed?
-    tool_name:   str                               # which tool to call (e.g. "generate_pdf_from_text")
-    tool_args:   dict                              # arguments to pass to that tool
-    tool_log:    Annotated[list, operator.add]     # growing log of tool calls + results
-    final_answer: str                              # the completed response
+    question:      str
+    history:       list
+    needs_tool:    bool
+    tool_name:     str
+    tool_args:     dict
+    tool_log:      Annotated[list, operator.add]   # accumulates across iterations
+    final_answer:  str
+    iteration:     int   # how many tool calls have been made so far
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # THE MODEL
-# Same local Ollama server as router.py — no external connections.
 # ══════════════════════════════════════════════════════════════════════════════
 
 _llm = ChatOllama(
@@ -135,72 +169,80 @@ _llm = ChatOllama(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 1: CLASSIFY
-# Asks the model: "Does this question need a tool, and if so which one?"
-# Returns: needs_tool (bool), tool_name (str), tool_args (dict)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Build a short summary of available tools to include in the classify prompt.
-_TOOL_SUMMARY = "\n".join(
-    f"  - {s['function']['name']}: {s['function']['description']}"
-    for s in TOOL_SCHEMAS
-)
-
-_CLASSIFY_SYSTEM = f"""You are a routing assistant deciding if a user's request needs a tool.
+_CLASSIFY_SYSTEM_TEMPLATE = """\
+You are a routing assistant deciding if a user's request needs a tool.
 
 Available tools:
-{_TOOL_SUMMARY}
+{tool_summary}
 
-Reply with ONLY valid JSON in this exact format — nothing before or after it:
+Previous tool results (if any):
+{{tool_context}}
+
+Reply with ONLY valid JSON — no markdown, no explanation, nothing before or after it:
 {{
   "needs_tool": true or false,
   "tool_name": "exact_function_name or empty string if no tool",
   "tool_args": {{argument key-value pairs, or empty object if no tool}}
 }}
 
-If needs_tool is false, set tool_name to "" and tool_args to {{}}.
-If needs_tool is true, fill in tool_name with one of the exact function names above,
-and tool_args with the arguments that function needs.
-Do not invent argument keys — use only the parameters described for that tool.
+Rules:
+- If needs_tool is false, set tool_name to "" and tool_args to {{}}.
+- If needs_tool is true, fill in tool_name with exactly one name from the list above.
+- Only include argument keys that are listed in that tool's parameter description.
+- Do NOT invent argument keys.
+- The content/text argument should contain the FULL relevant content, not a placeholder.
+- If a previous tool already produced the result needed to answer, set needs_tool to false.
 """
+
+_CLASSIFY_SYSTEM_BASE = _CLASSIFY_SYSTEM_TEMPLATE.format(tool_summary=_tool_summary())
 
 
 def classify_node(state: AgentState) -> dict:
-    """
-    NODE 1: CLASSIFY
-    Determines if the question requires a tool call.
-    Asks the LLM to produce structured JSON so we can parse the decision cleanly.
-    """
-    sys_prompt = _load_system_prompt()
+    """NODE 1: Determines if the question requires a tool call."""
+    # If we've hit the iteration cap, force direct response
+    if state.get("iteration", 0) >= MAX_TOOL_ITERATIONS:
+        _log(f"[classify] Hit MAX_TOOL_ITERATIONS ({MAX_TOOL_ITERATIONS}), forcing direct response")
+        return {"needs_tool": False, "tool_name": "", "tool_args": {}}
 
-    # Include recent conversation history so the model has context.
     history_msgs = _history_to_lc_messages(state["history"])
 
+    # Build tool context summary for re-classification after tool use
+    tool_context = ""
+    if state.get("tool_log"):
+        parts = []
+        for entry in state["tool_log"]:
+            parts.append(f"  Tool '{entry['tool']}' → {str(entry['result'])[:300]}")
+        tool_context = "\n".join(parts)
+
+    classify_system = _CLASSIFY_SYSTEM_BASE.replace("{tool_context}", tool_context or "None yet")
+
     messages = (
-        [SystemMessage(content=_CLASSIFY_SYSTEM)]
+        [SystemMessage(content=classify_system)]
         + history_msgs
         + [HumanMessage(content=state["question"])]
     )
 
-    response = _llm.invoke(messages)
-    raw      = response.content.strip()
-
-    # Try to parse the JSON the model returned.
-    # If parsing fails for any reason, fall back to "no tool needed".
     try:
-        # Strip markdown code fences in case the model added them.
-        if raw.startswith("```"):
-            raw = "\n".join(raw.split("\n")[1:-1])
-        parsed     = json.loads(raw)
+        response = _llm.invoke(messages)
+        raw      = response.content.strip()
+
+        parsed     = _extract_json_from_response(raw)
         needs_tool = bool(parsed.get("needs_tool", False))
         tool_name  = str(parsed.get("tool_name", "")).strip()
         tool_args  = dict(parsed.get("tool_args", {}))
 
-        # Safety: if needs_tool but tool_name isn't a real tool, disable it.
+        # Safety: if needs_tool but tool_name isn't a real tool, disable it
         if needs_tool and tool_name not in TOOL_FUNCTIONS:
+            _log(f"[classify] LLM suggested unknown tool '{tool_name}', disabling")
             needs_tool = False
             tool_name  = ""
             tool_args  = {}
-    except Exception:
+
+        _log(f"[classify] needs_tool={needs_tool} tool={tool_name!r} iteration={state.get('iteration', 0)}")
+    except Exception as exc:
+        _log(f"[classify] JSON parse failed: {exc} — defaulting to direct response")
         needs_tool = False
         tool_name  = ""
         tool_args  = {}
@@ -214,85 +256,81 @@ def classify_node(state: AgentState) -> dict:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BRANCHING CONDITION
-# Called automatically by LangGraph after classify_node.
-# Returns the label of the next node to run.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def route_after_classify(state: AgentState) -> Literal["needs_tool", "direct"]:
-    """
-    If classify_node said a tool is needed, go to the tools node.
-    Otherwise jump straight to respond.
-    """
     return "needs_tool" if state["needs_tool"] else "direct"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 2: TOOLS
-# Only reached when classify said needs_tool=True.
-# Calls the real tool from tools.py and stores the result in tool_log.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def tools_node(state: AgentState) -> dict:
-    """
-    NODE 2: TOOLS
-    Executes the tool that classify_node selected.
-    Logs what was called and what the result was so respond_node can use it.
-    """
+    """NODE 2: Executes the tool selected by classify_node, then loops back."""
     tool_name = state["tool_name"]
     tool_args = state["tool_args"]
 
-    if tool_name not in TOOL_FUNCTIONS:
-        # Shouldn't happen because classify_node already validated, but be safe.
-        log_entry = {
-            "tool":   tool_name,
-            "args":   tool_args,
-            "result": f"Error: '{tool_name}' is not a registered tool.",
-        }
-        return {"tool_log": [log_entry]}
+    # Defensive: args might arrive as a JSON string
+    if isinstance(tool_args, str):
+        try:
+            tool_args = json.loads(tool_args)
+        except Exception:
+            tool_args = {}
 
-    try:
-        result = TOOL_FUNCTIONS[tool_name](**tool_args)
-    except Exception as e:
-        result = f"Error running {tool_name}: {e}"
+    if tool_name not in TOOL_FUNCTIONS:
+        result = f"Error: '{tool_name}' is not a registered tool."
+        _log(f"[tools] Unknown tool: {tool_name}")
+    else:
+        try:
+            _log(f"[tools] Calling '{tool_name}' with args: {list(tool_args.keys())}")
+            result = TOOL_FUNCTIONS[tool_name](**tool_args)
+            _log(f"[tools] '{tool_name}' result: {str(result)[:120]}")
+        except TypeError as e:
+            # Missing or unexpected keyword arguments
+            result = f"Error: wrong arguments for tool '{tool_name}': {e}"
+            _log(f"[tools] TypeError in '{tool_name}': {e}")
+        except Exception as e:
+            result = f"Error running tool '{tool_name}': {e}"
+            _log(f"[tools] Exception in '{tool_name}': {e}")
 
     log_entry = {
         "tool":   tool_name,
         "args":   tool_args,
         "result": str(result),
     }
-    # tool_log uses operator.add, so returning a list appends to any existing entries.
-    return {"tool_log": [log_entry]}
+
+    return {
+        "tool_log":  [log_entry],          # Annotated[list] reducer appends this
+        "iteration": state.get("iteration", 0) + 1,
+        # Reset tool fields — classify will repopulate if another tool is needed
+        "needs_tool": False,
+        "tool_name":  "",
+        "tool_args":  {},
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 3: RESPOND
-# Always the last node. Generates the final human-readable answer.
-# If tools were called, their results are injected into context so the LLM
-# can reference them naturally in its reply.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def respond_node(state: AgentState) -> dict:
-    """
-    NODE 3: RESPOND
-    Always runs last. Produces the final answer.
-    Has full visibility of what tools ran and what they returned.
-    """
-    sys_prompt = _load_system_prompt()
+    """NODE 3: Generates the final human-readable answer."""
+    sys_prompt   = _load_system_prompt()
     history_msgs = _history_to_lc_messages(state["history"])
 
-    # Build a context block from any tool results.
     tool_context = ""
     if state.get("tool_log"):
         parts = []
         for entry in state["tool_log"]:
+            args_summary = ", ".join(f"{k}={repr(str(v))[:60]}" for k, v in entry.get("args", {}).items())
             parts.append(
-                f"Tool '{entry['tool']}' was called with args {entry['args']}.\n"
+                f"Tool '{entry['tool']}' was called with ({args_summary}).\n"
                 f"Result: {entry['result']}"
             )
         tool_context = "\n\n".join(parts)
 
     if tool_context:
-        # Tell the LLM what the tool returned, then ask for a friendly summary.
         messages = (
             [SystemMessage(content=sys_prompt)]
             + history_msgs
@@ -300,102 +338,124 @@ def respond_node(state: AgentState) -> dict:
                 HumanMessage(content=state["question"]),
                 AIMessage(content=f"[Tool results]\n{tool_context}"),
                 HumanMessage(content=(
-                    "Using the tool results above, give a clear and friendly final answer "
-                    "to the original question. If a file was created, mention its path."
+                    "Using the tool results above, give a clear, complete, and friendly final answer "
+                    "to the original question. If a file was created or saved, mention its exact path. "
+                    "If data was extracted, summarize the key findings."
                 )),
             ]
         )
     else:
-        # No tools were used — answer directly from knowledge.
         messages = (
             [SystemMessage(content=sys_prompt)]
             + history_msgs
             + [HumanMessage(content=state["question"])]
         )
 
-    response = _llm.invoke(messages)
-    return {"final_answer": response.content.strip()}
+    try:
+        response = _llm.invoke(messages)
+        final_answer = response.content.strip()
+    except Exception as exc:
+        final_answer = f"I encountered an error generating a response: {exc}"
+
+    if not final_answer:
+        final_answer = "I completed the requested actions. Please check the generated_files/ directory for any output files."
+
+    _log(f"[respond] Final answer length: {len(final_answer)} chars")
+    return {"final_answer": final_answer}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BUILD THE GRAPH
-# Wires nodes and edges together, then compiles into a runnable object.
+# SIMPLE LOGGER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _log(msg: str):
+    """Internal logger — prints to stderr so it doesn't interfere with stdout streaming."""
+    try:
+        print(f"[agent] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BUILD THE GRAPH (compiled once at import time)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_graph():
-    """
-    Assembles and compiles the LangGraph agent graph.
-    The compiled object is cached in the module-level variable _GRAPH below
-    so we only build it once per process.
-    """
     builder = StateGraph(AgentState)
 
-    # Register nodes
-    builder.add_node("classify", classify_node)   # Node 1: classify intent
-    builder.add_node("tools",    tools_node)       # Node 2: run tool (optional)
-    builder.add_node("respond",  respond_node)     # Node 3: generate final answer
+    builder.add_node("classify", classify_node)
+    builder.add_node("tools",    tools_node)
+    builder.add_node("respond",  respond_node)
 
-    # Entry point
     builder.set_entry_point("classify")
 
-    # Conditional branch after classify
+    # After classify: go to tools or skip directly to respond
     builder.add_conditional_edges(
-        "classify",             # source
-        route_after_classify,   # function that decides which way to go
+        "classify",
+        route_after_classify,
         {
-            "needs_tool": "tools",    # -> go to tools node
-            "direct":     "respond",  # -> skip tools, go straight to respond
+            "needs_tool": "tools",
+            "direct":     "respond",
         },
     )
 
-    # After tools always go to respond
-    builder.add_edge("tools", "respond")
-
-    # After respond the graph ends
-    builder.add_edge("respond", END)
+    # After tools: loop back to classify (to check if another tool is needed)
+    # classify will eventually route to "direct" → respond when done
+    builder.add_edge("tools",    "classify")
+    builder.add_edge("respond",  END)
 
     return builder.compile()
 
 
-# Compile once at import time — reused for every call.
 _GRAPH = _build_graph()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PUBLIC API
-# These are the two functions that main.py and ask.py import.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_agent(query: str, history: list | None = None) -> dict:
     """
-    Run the LangGraph agent on a single question and return the result.
+    Run the LangGraph agent on a single question.
 
     Args:
         query   : the user's question or instruction
         history : list of {role, content} dicts from router.HISTORY (may be empty)
 
-    Returns a dict with:
+    Returns:
         final_answer  : str  — the agent's response
-        needs_tool    : bool — whether a tool was called
+        needs_tool    : bool — whether any tool was called
         tool_log      : list — details of every tool call made
     """
     if history is None:
         history = []
 
     initial_state: AgentState = {
-        "question":    query,
-        "history":     history,
-        "needs_tool":  False,
-        "tool_name":   "",
-        "tool_args":   {},
-        "tool_log":    [],
+        "question":     query,
+        "history":      history,
+        "needs_tool":   False,
+        "tool_name":    "",
+        "tool_args":    {},
+        "tool_log":     [],
         "final_answer": "",
+        "iteration":    0,
     }
 
-    result = _GRAPH.invoke(initial_state)
+    try:
+        result = _GRAPH.invoke(initial_state)
+    except Exception as exc:
+        _log(f"[run_agent] Graph execution error: {exc}")
+        return {
+            "final_answer": f"Agent encountered an error: {exc}",
+            "needs_tool":   False,
+            "tool_log":     [],
+        }
+
+    tool_log   = result.get("tool_log", [])
+    needs_tool = len(tool_log) > 0  # true if any tool was actually called
 
     return {
-        "final_answer": result["final_answer"],
-        "needs_tool":   result["needs_tool"],
-        "tool_log":     result.get("tool_log", []),
+        "final_answer": result.get("final_answer", ""),
+        "needs_tool":   needs_tool,
+        "tool_log":     tool_log,
     }

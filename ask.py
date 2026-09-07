@@ -7,7 +7,7 @@ Features:
     - Code + Walkthrough: ordered sequential pipeline for code generation followed by explanation
     - Vision: inspect local images or web URLs using qwen2.5vl:7b
     - Document Ingestion: upload and query Excel (.xlsx), Word (.docx), and PDF (.pdf) files
-    - LangGraph Autonomous Agent: multi-step structured agent with tool execution
+    - LangGraph Autonomous Agent: multi-step structured agent with multi-tool execution
     - Interactive Chat History & Context Memory Management
 """
 
@@ -15,13 +15,9 @@ import sys
 import time
 import base64
 import os
-import random
 import threading
 import datetime
-import glob
 import json
-import re
-import shlex
 import requests as _requests
 
 from offline_guard import enable_offline_mode, allow_external
@@ -43,6 +39,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+import db
 import router
 from router import (
     classify_question,
@@ -66,6 +63,10 @@ THINKING_PHRASES = [
     "💭 Composing precise response...",
     "✨ Synthesizing output...",
 ]
+
+# ── Max characters to show per message in history view ───────────────────────
+_HISTORY_MSG_TRUNCATE = 200
+_HISTORY_MAX_MSGS     = 20
 
 
 def _clean_path(path: str) -> str:
@@ -93,7 +94,7 @@ def show_spinner(messages, stop_flag, start_time):
         sys.stdout.flush()
         i += 1
         time.sleep(0.08)
-    sys.stdout.write("\r" + " " * 80 + "\r")
+    sys.stdout.write("\r" + " " * 90 + "\r")
     sys.stdout.flush()
 
 
@@ -105,7 +106,7 @@ def run_with_spinner(messages, work_fn):
     """Runs work_fn() while an animated spinner displays."""
     start_time = time.time()
     stop = [False]
-    spinner = threading.Thread(target=show_spinner, args=(messages, stop, start_time))
+    spinner = threading.Thread(target=show_spinner, args=(messages, stop, start_time), daemon=True)
     spinner.start()
     try:
         result = work_fn()
@@ -118,10 +119,11 @@ def run_with_spinner(messages, work_fn):
 def stream_with_spinner(model, query):
     """
     Shows a spinner until the first token arrives, then streams tokens live.
+    Tool-call notification lines are highlighted; all other tokens print normally.
     """
     start_time = time.time()
     stop = [False]
-    spinner = threading.Thread(target=show_spinner, args=(THINKING_PHRASES, stop, start_time))
+    spinner = threading.Thread(target=show_spinner, args=(THINKING_PHRASES, stop, start_time), daemon=True)
     spinner.start()
 
     full_answer = ""
@@ -132,8 +134,15 @@ def stream_with_spinner(model, query):
                 stop[0] = True
                 spinner.join()
                 spinner_stopped = True
-            full_answer += token
-            sys.stdout.write(token)
+
+            # Tool notification lines — print with colour, not inline with answer text
+            if token.startswith("\n\n[System: Calling tool"):
+                sys.stdout.write("\n")
+                console.print(f"  [bold yellow]{token.strip()}[/bold yellow]")
+                sys.stdout.write("\n")
+            else:
+                full_answer += token
+                sys.stdout.write(token)
             sys.stdout.flush()
     finally:
         if not spinner_stopped:
@@ -147,6 +156,25 @@ def stream_with_spinner(model, query):
 # ══════════════════════════════════════════════════════════════════════════════
 # INTERACTIVE WELCOME & HELP
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _check_ollama_models() -> dict:
+    """Check which configured models are available in Ollama."""
+    available = {}
+    try:
+        import ollama as _ollama
+        with allow_external():
+            pulled = {m["name"] for m in _ollama.list()["models"]}
+        # Normalize: strip digest tags for comparison
+        pulled_base = {n.split(":")[0] for n in pulled} | pulled
+        for role, model in AVAILABLE_MODELS.items():
+            base = model.split(":")[0]
+            available[model] = (model in pulled) or (base in pulled_base)
+    except Exception:
+        # If we can't check, assume all are available
+        for model in AVAILABLE_MODELS.values():
+            available[model] = True
+    return available
+
 
 def print_welcome_banner():
     banner_text = (
@@ -207,19 +235,25 @@ def print_welcome_banner():
         "🛠️ LangGraph Agent",
         '/agent <instruction>',
         "qwen2.5:14b + Tools",
-        "Autonomous agent with tools (PDF, Word, RAG search)"
+        "Autonomous agent: create PDF, Word, CSV, extract text & more"
     )
     table.add_row(
-        "📜 Past Sessions",
+        "📜 Session History",
         'history',
         "Session Store",
-        "View and browse past interactive chat transcripts"
+        "Browse past chat sessions with message preview"
+    )
+    table.add_row(
+        "🗑️ List Output Files",
+        '/files',
+        "File Manager",
+        "List all generated files (PDFs, Word docs, CSVs)"
     )
     table.add_row(
         "🧹 Reset Memory",
         'reset',
         "Memory Guard",
-        "Clears current conversation turns from RAM"
+        "Clears current conversation context from RAM"
     )
     table.add_row(
         "❓ Full Help / Cheat Sheet",
@@ -243,11 +277,15 @@ def print_help_guide():
         ("👁️ Vision", '/image "C:\\Users\\me\\Pictures\\diagram.png" What architecture is shown here?'),
         ("👁️ Vision (Web)", '/image https://example.com/logo.png Describe this logo in detail.'),
         ("📄 Excel File", '1) upload "C:\\data\\sales.xlsx"\n   2) What is the total revenue in this sheet?'),
-        ("📄 PDF File", '1) upload "C:\\docs\\manual.pdf"\n   2) Summarize the safety guidelines in this pdf.'),
-        ("🛠️ Agent Tools", '/agent Create a Word document titled "Quarterly Update" with 3 key highlights.'),
-        ("🛠️ PDF Tools", '/agent Extract all text from "generated_files/sample.pdf" and summarize it.'),
-        ("🗂️ Complex Split", '/complex Write a marketing email for product launch AND generate SQL to find buyers.'),
+        ("📄 PDF File", '1) upload "C:\\docs\\manual.pdf"\n   2) Summarize the safety guidelines.'),
+        ("🛠️ Agent — Word", '/agent Create a Word document titled "Q3 Report" with 3 bullet highlights about AI trends.'),
+        ("🛠️ Agent — PDF", '/agent Generate a PDF titled "Meeting Notes" with agenda items for a project kickoff.'),
+        ("🛠️ Agent — CSV", '/agent Create a CSV file with columns Name, Score, Grade and 5 sample student rows.'),
+        ("🛠️ Agent — Extract", '/agent Extract all text from "generated_files/sample.pdf" and give me a summary.'),
+        ("🛠️ Agent — Chain", '/agent Generate a PDF about Python basics, then tell me how many pages it has.'),
+        ("🗂️ Complex Split", '/complex Write a marketing email for a product launch AND generate SQL to find top buyers.'),
         ("🧹 Reset", 'reset (clears conversation context so you can start a fresh topic).'),
+        ("🗑️ List Files", '/files (shows all files created in generated_files/ directory)'),
     ]
 
     for cat, ex in examples:
@@ -354,8 +392,8 @@ def ask_anything(query, force_multi=False):
 
 
 def handle_agent(query):
-    stage("🛠️ [LangGraph Agent]", "Initializing structured reasoning graph (classify ➔ tools? ➔ respond)...", style="bold magenta")
-    stage("🤖 [Model]", "qwen2.5:14b with dynamic tool calling", style="cyan")
+    stage("🛠️ [LangGraph Agent]", "Initializing multi-tool reasoning graph (classify ➔ tools? ➔ classify ➔ ... ➔ respond)...", style="bold magenta")
+    stage("🤖 [Model]", "qwen2.5:14b with dynamic tool calling (up to 5 tools per request)", style="cyan")
     console.print("-" * 65, style="dim")
 
     start_time = time.time()
@@ -367,7 +405,7 @@ def handle_agent(query):
         return
 
     result = run_with_spinner(
-        ["Analyzing intent...", "Invoking registered tools...", "Synthesizing comprehensive response..."],
+        ["Analyzing intent...", "Invoking registered tools...", "Checking if more tools needed...", "Synthesizing comprehensive response..."],
         lambda: run_agent(query, history=get_history()),
     )
 
@@ -375,16 +413,28 @@ def handle_agent(query):
 
     if result.get("needs_tool") and result.get("tool_log"):
         tool_table = Table(title="🛠️ Tools Executed by Agent", box=box.ROUNDED, border_style="green")
+        tool_table.add_column("#", justify="right", style="bold cyan", no_wrap=True)
         tool_table.add_column("Tool", style="bold yellow")
+        tool_table.add_column("Args", style="dim")
         tool_table.add_column("Result", style="white")
-        for entry in result["tool_log"]:
-            tool_table.add_row(entry["tool"], str(entry["result"])[:150])
+        for i, entry in enumerate(result["tool_log"], 1):
+            args_str = ", ".join(f"{k}={repr(str(v))[:35]}" for k, v in entry.get("args", {}).items())
+            result_str = str(entry.get("result", ""))[:150]
+            tool_table.add_row(str(i), entry["tool"], args_str, result_str)
         console.print(tool_table)
         console.print()
 
-    console.print(result["final_answer"])
+    final_answer = result.get("final_answer", "").strip()
+    if not final_answer:
+        final_answer = "Agent completed the task. Check the generated_files/ directory for any output files."
+
+    # Render with Markdown so code blocks, headings, bold text all display correctly
+    console.print(Markdown(final_answer))
     console.print("-" * 65, style="dim")
-    console.print(f"  ✅ [bold green]Done in {elapsed}s[/bold green] | Autonomous LangGraph Agent | [cyan]qwen2.5:14b[/cyan]\n")
+
+    tool_count = len(result.get("tool_log", []))
+    tool_info  = f" | [green]{tool_count} tool(s) called[/green]" if tool_count else ""
+    console.print(f"  ✅ [bold green]Done in {elapsed}s[/bold green]{tool_info} | Autonomous LangGraph Agent | [cyan]qwen2.5:14b[/cyan]\n")
 
 
 def parse_image_command(rest: str):
@@ -402,19 +452,36 @@ def parse_image_command(rest: str):
     if rest.startswith('"'):
         end_idx = rest.find('"', 1)
         if end_idx != -1:
-            source = rest[1:end_idx]
+            source   = rest[1:end_idx]
             question = rest[end_idx + 1:].strip()
             return source, question
     elif rest.startswith("'"):
         end_idx = rest.find("'", 1)
         if end_idx != -1:
-            source = rest[1:end_idx]
+            source   = rest[1:end_idx]
             question = rest[end_idx + 1:].strip()
             return source, question
 
-    # Fallback to standard single space split
-    parts = rest.split(" ", 1)
-    source = parts[0]
+    # Check for URL — split at first whitespace after the URL
+    if rest.startswith("http://") or rest.startswith("https://"):
+        parts    = rest.split(" ", 1)
+        source   = parts[0]
+        question = parts[1].strip() if len(parts) > 1 else ""
+        return source, question
+
+    # For local paths: find the last valid path-like prefix by checking existence
+    # Try progressively longer tokens until the path exists, then use the rest as the question
+    tokens = rest.split(" ")
+    for end in range(len(tokens), 0, -1):
+        candidate = " ".join(tokens[:end])
+        norm = os.path.normpath(candidate)
+        if os.path.isfile(norm):
+            question = " ".join(tokens[end:]).strip()
+            return norm, question
+
+    # Last resort: split on first space
+    parts    = rest.split(" ", 1)
+    source   = parts[0]
     question = parts[1].strip() if len(parts) > 1 else ""
     return source, question
 
@@ -469,7 +536,7 @@ def handle_image(source, question):
 
     start_time = time.time()
     stop = [False]
-    spinner = threading.Thread(target=show_spinner, args=(THINKING_PHRASES, stop, start_time))
+    spinner = threading.Thread(target=show_spinner, args=(THINKING_PHRASES, stop, start_time), daemon=True)
     spinner.start()
 
     full_answer = ""
@@ -496,19 +563,115 @@ def handle_image(source, question):
     console.print(f"  ✅ [bold green]Done in {elapsed}s[/bold green] | Model: [cyan]{IMAGE_MODEL}[/cyan] | ~[yellow]{token_count}[/yellow] tokens\n")
 
 
+def handle_list_files():
+    """Show all files in the generated_files/ directory."""
+    from tools import _OUTPUT_DIR, list_generated_files
+    result = list_generated_files()
+    console.print(Panel(result, title="🗂️ Generated Files", border_style="green", padding=(0, 1)))
+    console.print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION HISTORY VIEWER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def handle_history():
+    """Reads sessions and messages from PostgreSQL and displays them."""
+    if not db.is_ready():
+        console.print(Panel(
+            f"[bold red]PostgreSQL is not available.[/bold red]\n[dim]{db.get_error()}[/dim]\n\n"
+            "Check your credentials in [yellow]db_config.json[/yellow] and ensure PostgreSQL is running.",
+            title="Database Unavailable",
+            border_style="red",
+        ))
+        return
+
+    sessions = db.get_all_sessions(limit=15)
+    if not sessions:
+        console.print("  [dim]No sessions found in the database yet.[/dim]\n")
+        return
+
+    hist_table = Table(
+        title=f"Saved Chat Sessions ({db.get_session_count()} total in DB)",
+        box=box.ROUNDED,
+        border_style="cyan",
+    )
+    hist_table.add_column("#",            justify="right",  style="bold cyan",    no_wrap=True)
+    hist_table.add_column("Session Name",                   style="yellow")
+    hist_table.add_column("Started",                        style="dim")
+    hist_table.add_column("Last Activity",                  style="dim")
+    hist_table.add_column("Messages",     justify="right",  style="green")
+
+    for i, s in enumerate(sessions, 1):
+        hist_table.add_row(
+            str(i),
+            s["session_name"],
+            s["created_at"],
+            s["last_activity"],
+            str(s["message_count"]),
+        )
+    console.print(hist_table)
+
+    try:
+        choice = input("  Pick a session # to preview (or Enter to cancel): ").strip()
+        if not choice or not choice.isdigit():
+            console.print()
+            return
+
+        idx = int(choice)
+        if not (1 <= idx <= len(sessions)):
+            console.print("  [dim]Invalid selection.[/dim]\n")
+            return
+
+        selected    = sessions[idx - 1]
+        session_name = selected["session_name"]
+        messages    = db.get_session_messages(session_name, limit=_HISTORY_MAX_MSGS)
+
+        console.print(f"\n  [bold cyan]--- {session_name} ---[/bold cyan]")
+        console.print(f"  [dim]Showing last {len(messages)} message(s)[/dim]\n")
+
+        for msg in messages:
+            role       = msg.get("role", "unknown")
+            content    = msg.get("content", "").strip()
+            timestamp  = msg.get("created_at", "")
+            role_color = "bold green" if role == "user" else "bold magenta"
+            role_label = "You" if role == "user" else "Agent"
+
+            # Truncate long messages
+            if len(content) > _HISTORY_MSG_TRUNCATE:
+                content = content[:_HISTORY_MSG_TRUNCATE] + f"... [{len(content) - _HISTORY_MSG_TRUNCATE} more chars]"
+
+            console.print(f"  [{role_color}]{role_label}[/{role_color}] [dim]{timestamp}[/dim]")
+            console.print(f"  {content}")
+            console.print("  " + "-" * 55, style="dim")
+
+    except Exception as e:
+        console.print(f"  [dim]Error viewing session: {e}[/dim]")
+    print()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN INTERACTIVE LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     os.makedirs("chat_sessions", exist_ok=True)
-    session_filename = datetime.datetime.now().strftime("session_%Y-%m-%d_%H-%M-%S.json")
-    session_path = os.path.join("chat_sessions", session_filename)
-    router.start_new_session(session_path)
+
+    # ── Initialise PostgreSQL ────────────────────────────────────────────────
+    db_ok = db.init_db()
+    if db_ok:
+        stage("🗄️  [Database]", "PostgreSQL session store connected and ready.", style="bold green")
+    else:
+        stage("⚠️  [Database]", f"PostgreSQL unavailable — sessions will NOT be saved. ({db.get_error()[:80]})", style="bold red")
+        console.print("  [dim]Check db_config.json and ensure PostgreSQL is running on localhost.[/dim]")
+
+    # ── Session name (human-readable, used as DB primary key) ────────────────
+    session_name = datetime.datetime.now().strftime("session_%Y-%m-%d_%H-%M-%S")
+    router.start_new_session(session_name)
 
     print_welcome_banner()
 
-    current_file_path = None
+    current_file_path    = None
     current_file_content = None
 
     while True:
@@ -520,85 +683,68 @@ def main():
             if not query:
                 continue
 
-            # Check exit
+            # ── Exit ──────────────────────────────────────────────────────────
             if query.lower() in ["exit", "quit", ":q"]:
                 console.print("\n[bold cyan]👋 Thank you for using Agent OTG. Goodbye![/bold cyan]\n")
                 break
 
-            # Help
+            # ── Help ──────────────────────────────────────────────────────────
             if query.lower() in ["help", "/help", "?", "--help"]:
                 print_help_guide()
                 continue
 
-            # Clear screen
+            # ── Clear screen ──────────────────────────────────────────────────
             if query.lower() in ["clear", "cls"]:
                 os.system("cls" if os.name == "nt" else "clear")
                 print_welcome_banner()
                 continue
 
-            # Reset memory
+            # ── Reset memory ──────────────────────────────────────────────────
             if query.lower() == "reset":
                 clear_history()
-                stage("🧹 [Memory]", "Conversation context memory has been cleared!", style="bold green")
+                current_file_path    = None
+                current_file_content = None
+                stage("🧹 [Memory]", "Conversation context and loaded file cleared!", style="bold green")
                 print()
                 continue
 
-            # Upload document
+            # ── List generated files ──────────────────────────────────────────
+            if query.lower() in ["/files", "files", "/ls", "ls"]:
+                handle_list_files()
+                continue
+
+            # ── Upload document ───────────────────────────────────────────────
             if query.lower().startswith("upload "):
                 raw_path = query[7:].strip()
-                path = _clean_path(raw_path)
+                path     = _clean_path(raw_path)
                 from file_readers import process_file
                 result = process_file(path)
                 if result.startswith("Error:"):
                     console.print(f"  ❌ [bold red]{result}[/bold red]\n")
                 else:
-                    current_file_path = path
+                    current_file_path    = path
                     current_file_content = result
-                    stage("📄 [Uploaded]", f"Successfully ingested [bold yellow]{os.path.basename(path)}[/bold yellow] ({len(result):,} characters)", style="bold green")
+                    char_count = len(result)
+                    stage("📄 [Uploaded]", f"Successfully ingested [bold yellow]{os.path.basename(path)}[/bold yellow] ({char_count:,} chars)", style="bold green")
                     console.print("  [dim]You can now ask questions about it by mentioning 'this file', 'this document', etc.[/dim]\n")
                 continue
 
-            # History inspection
-            if query.lower() == "history":
-                sessions = sorted(glob.glob("chat_sessions/*.json"))
-                if not sessions:
-                    console.print("  [dim]No saved chat sessions found.[/dim]\n")
-                    continue
-
-                hist_table = Table(title="📜 Saved Chat Sessions", box=box.ROUNDED, border_style="cyan")
-                hist_table.add_column("#", justify="right", style="cyan")
-                hist_table.add_column("Session File", style="yellow")
-                for i, s in enumerate(sessions[-10:], 1):
-                    hist_table.add_row(str(i), os.path.basename(s))
-                console.print(hist_table)
-
-                try:
-                    choice = input("  Pick a session number to inspect (or press Enter to cancel): ").strip()
-                    if choice and choice.isdigit():
-                        idx = int(choice)
-                        if 1 <= idx <= min(10, len(sessions)):
-                            selected_session = sessions[-10:][idx - 1]
-                            with open(selected_session, "r", encoding="utf-8") as f:
-                                data = json.load(f)
-                                console.print(f"\n--- Transcripts for {os.path.basename(selected_session)} ---", style="bold cyan")
-                                for msg in data:
-                                    role_color = "green" if msg.get("role") == "user" else "magenta"
-                                    console.print(f"[{msg.get('timestamp')}] [{role_color}]{msg.get('role', '').upper()}:[/{role_color}]")
-                                    console.print(msg.get("content", "").strip())
-                                    console.print("-" * 50, style="dim")
-                except Exception as e:
-                    console.print(f"  [dim]Error viewing session: {e}[/dim]")
-                print()
+            # ── History inspection ────────────────────────────────────────────
+            if query.lower() in ["history", "/history"]:
+                handle_history()
                 continue
 
-            # Inject active file content if referenced
+            # ── Inject active file content if referenced ──────────────────────
             if current_file_path and current_file_content:
-                trigger_phrases = ["this file", "this document", "this sheet", "this pdf", "the uploaded file", "the data"]
+                trigger_phrases = [
+                    "this file", "this document", "this sheet", "this pdf",
+                    "the uploaded file", "the data", "the file", "uploaded",
+                ]
                 if any(phrase in query.lower() for phrase in trigger_phrases):
                     query += f"\n\n--- Ingested Content of {os.path.basename(current_file_path)} ---\n{current_file_content}\n--- End of file content ---"
-                    stage("📎 [Attachment]", f"Attached content from {os.path.basename(current_file_path)} to prompt", style="dim")
+                    stage("📎 [Attachment]", f"Attached content from [yellow]{os.path.basename(current_file_path)}[/yellow] to prompt", style="dim")
 
-            # Routing command triggers
+            # ── Command routing ───────────────────────────────────────────────
             if query.startswith("/complex "):
                 ask_anything(query[len("/complex "):].strip(), force_multi=True)
             elif query.startswith("/agent "):
