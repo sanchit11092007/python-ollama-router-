@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import traceback
 from functools import lru_cache
+
+logger = logging.getLogger("rag.pipeline")
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_ollama import ChatOllama
@@ -93,25 +97,82 @@ def _format_docs(docs) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
+
+def categorize_ingestion_error(exc: Exception) -> str:
+    err_msg = str(exc)
+    exc_type = type(exc).__name__
+    err_lower = err_msg.lower()
+
+    if isinstance(exc, FileNotFoundError) or "file not found" in err_lower:
+        return f"File not found: {err_msg}"
+    if isinstance(exc, PermissionError) or "permission denied" in err_lower:
+        return f"Permission denied: {err_msg}"
+    if isinstance(exc, UnicodeDecodeError) or "encoding error" in err_lower:
+        return f"Encoding error: {err_msg}"
+    if "csv parsing error" in err_lower or "parsererror" in exc_type.lower() or "parsererror" in err_lower:
+        return f"CSV parsing error: {err_msg}"
+    if isinstance(exc, ValueError) and "unsupported format" in err_lower:
+        return f"Unsupported format: {err_msg}"
+    if "vectorization" in err_lower or "ollama" in exc_type.lower() or "ollama" in err_lower or "embedding" in err_lower:
+        return f"Vectorization error: {err_msg}"
+    if "chroma" in exc_type.lower() or "chroma" in err_lower or "database" in err_lower or "storage" in err_lower:
+        return f"Database storage error: {err_msg}"
+
+    return f"Ingestion error: {err_msg}"
+
+
+
 # ── Ingestion ─────────────────────────────────────────────────────────────────
 
 def ingest_paths(paths: list[str], replace_existing: bool = True) -> dict:
-    raw_docs = load_files(paths)
-    if replace_existing:
-        sources = {d.metadata.get("source") for d in raw_docs if d.metadata.get("source")}
-        for source in sources:
-            delete_source(source)
-    chunks = split_documents(raw_docs)
-    count  = add_documents(chunks)
-    return {
-        "files":            len(paths),
-        "documents_loaded": len(raw_docs),
-        "chunks_indexed":   count,
-    }
+    try:
+        raw_docs = load_files(paths)
+        if replace_existing:
+            sources = {d.metadata.get("source") for d in raw_docs if d.metadata.get("source")}
+            for source in sources:
+                try:
+                    delete_source(source)
+                except Exception as del_err:
+                    logger.debug(f"Delete source failed: {del_err}\n{traceback.format_exc()}")
+        
+        chunks = split_documents(raw_docs)
+        
+        try:
+            count = add_documents(chunks)
+        except Exception as embed_err:
+            logger.debug(f"Vectorization/Storage failed:\n{traceback.format_exc()}")
+            err_cat = categorize_ingestion_error(embed_err)
+            raise RuntimeError(err_cat) from embed_err
+
+        loader_name = raw_docs[0].metadata.get("loader_name", "DocumentLoader") if raw_docs else "UnknownLoader"
+        rows_loaded = raw_docs[0].metadata.get("rows_loaded", len(raw_docs)) if raw_docs else 0
+
+        first_path = paths[0] if paths else ""
+        return {
+            "path":             first_path,
+            "file_exists":      True,
+            "loader":           loader_name,
+            "rows_loaded":      rows_loaded,
+            "documents_loaded": len(raw_docs),
+            "chunks_generated": len(chunks),
+            "embeddings_created": count,
+            "status":           "SUCCESS",
+            "files":            len(paths),
+            "chunks_indexed":   count,
+        }
+    except RuntimeError:
+        # Already categorized — re-raise as-is to avoid double-prefixing the message.
+        logger.debug(f"Ingestion error trace:\n{traceback.format_exc()}")
+        raise
+    except Exception as exc:
+        logger.debug(f"Ingestion error trace:\n{traceback.format_exc()}")
+        cat_msg = categorize_ingestion_error(exc)
+        raise RuntimeError(cat_msg) from exc
 
 
 def ingest_path(path: str, replace_existing: bool = True) -> dict:
     return ingest_paths([path], replace_existing=replace_existing)
+
 
 
 # ── RAG Answer (with query expansion loop) ───────────────────────────────────
@@ -134,36 +195,20 @@ def answer(
     The expansion loop dramatically improves recall without requiring
     MultiQueryRetriever or any extra dependencies.
     """
-    # ── Per-request top_k override (backward compat with search_documents tool) ──
-    from . import config as _c
-    old_top_k = None
-    if top_k is not None:
-        old_top_k    = _c.TOP_K
-        _c.TOP_K     = max(1, min(int(top_k), 20))
-
-    try:
-        # Step 1 — Expand query into semantic variants
-        queries = _expand_query(query)
-
-        # Step 2 — Multi-query retrieval with deduplication
-        if len(queries) > 1:
-            docs, selected_strategy = retrieve_expanded(
-                queries, strategy=strategy, access_filter=access_filter
-            )
-        else:
-            docs, selected_strategy = retrieve(
-                query, strategy=strategy, access_filter=access_filter
-            )
-
-        # Step 3 — Fallback: if expanded retrieval found nothing, try plain similarity
-        if not docs and len(queries) > 1:
-            docs, selected_strategy = retrieve(
-                query, strategy="similarity", access_filter=access_filter
-            )
-
-    finally:
-        if old_top_k is not None:
-            _c.TOP_K = old_top_k
+    requested_k = max(1, min(int(top_k), 20)) if top_k is not None else None
+    queries = _expand_query(query)
+    if len(queries) > 1:
+        docs, selected_strategy = retrieve_expanded(
+            queries, strategy=strategy, access_filter=access_filter, **({"top_k": requested_k} if requested_k else {})
+        )
+    else:
+        docs, selected_strategy = retrieve(
+            query, strategy=strategy, access_filter=access_filter, **({"top_k": requested_k} if requested_k else {})
+        )
+    if not docs and len(queries) > 1:
+        docs, selected_strategy = retrieve(
+            query, strategy="similarity", access_filter=access_filter, **({"top_k": requested_k} if requested_k else {})
+        )
 
     # Step 4 — No docs at all → early return
     if not docs:

@@ -18,6 +18,8 @@ import os
 import threading
 import datetime
 import json
+import re
+import traceback
 import requests as _requests
 
 from offline_guard import enable_offline_mode, allow_external
@@ -344,7 +346,19 @@ def handle_multi(query):
     console.print(f"  ✅ [bold green]All {len(tasks)} sub-tasks completed in {elapsed}s[/bold green]\n")
 
 
+def is_file_creation_request(text: str) -> bool:
+    """Detects whether user prompt is asking to generate, save, or export a file/document."""
+    t = text.lower()
+    has_action = bool(re.search(r"\b(generate|generatet|create|make|save|export|write|build|output|download)\b", t))
+    has_file = bool(re.search(r"\b(pdf|docx|word doc|word document|word|excel|xlsx|csv|pptx|powerpoint|spreadsheet)\b", t))
+    return has_action and has_file
+
+
 def ask_anything(query, force_multi=False):
+    if not force_multi and is_file_creation_request(query):
+        handle_agent(query)
+        return
+
     stage("🧠 [Understanding]", "Analyzing question structure and context...", style="bold blue")
     info = run_with_spinner(["Evaluating intent and routing logic..."], lambda: classify_question(query))
 
@@ -538,11 +552,45 @@ def handle_list_files():
     console.print()
 
 
+def is_file_path_arg(text: str) -> tuple[bool, str, str]:
+    """
+    Checks if text is or begins with a file path.
+    Returns (is_file, filepath, user_prompt).
+    """
+    filepath, prompt = parse_doc_command(text)
+    if not filepath:
+        return False, "", ""
+    ext = os.path.splitext(filepath)[1].lower()
+    valid_exts = (".csv", ".pdf", ".docx", ".xlsx", ".xls", ".txt", ".md", ".json")
+    if os.path.isfile(filepath) or ext in valid_exts:
+        return True, filepath, prompt
+    return False, "", ""
+
+
 def handle_rag(query: str):
     """Directly search the RAG knowledge base with query expansion."""
     if not query.strip():
-        console.print("  [dim]Usage: /rag <your question>[/dim]\n")
+        console.print("  [dim]Usage: /rag <your question>  or  /rag <file path> [prompt][/dim]\n")
         return
+
+    is_file, filepath, prompt = is_file_path_arg(query)
+    if is_file:
+        console.print(f"  💡 [cyan]File path detected in /rag. Ingesting into knowledge base...[/cyan]")
+        doc_path, user_p = handle_doc(query)
+        if user_p:
+            stage("🔍 [RAG Search]", f'Knowledge base query: "[cyan]{user_p[:70]}[/cyan]"', style="bold blue")
+            console.print("-" * 65, style="dim")
+            try:
+                from rag.pipeline import answer as _rag_answer
+                result = run_with_spinner(
+                    ["Expanding query variants...", "Retrieving relevant chunks...", "Synthesizing answer..."],
+                    lambda: _rag_answer(user_p),
+                )
+                console.print(Markdown(result.get("answer", "No answer found.")))
+            except Exception as exc:
+                console.print(f"  ❌ [bold red]RAG search failed:[/bold red] {exc}\n")
+        return
+
     stage("🔍 [RAG Search]", f'Knowledge base query: "[cyan]{query[:70]}[/cyan]"', style="bold blue")
     console.print("-" * 65, style="dim")
     start = time.time()
@@ -576,34 +624,115 @@ def handle_rag(query: str):
         console.print(f"  ❌ [bold red]RAG search failed:[/bold red] {exc}\n")
 
 
-def handle_doc(path: str):
-    """Ingest a file into the RAG vector knowledge base."""
-    path = _clean_path(path)
-    if not path or not os.path.isfile(path):
-        console.print(f"  ❌ [bold red]File not found:[/bold red] {path or '(no path given)'}\n")
-        return
-    stage("📂 [RAG Ingest]", f"Indexing [bold yellow]{os.path.basename(path)}[/bold yellow] into knowledge base...", style="bold green")
+def parse_doc_command(rest: str) -> tuple[str, str]:
+    r"""
+    Extracts filepath and optional user prompt from a /doc command string:
+      /doc "C:\Users\iamsa\Downloads\etp.csv"
+      /doc "C:\Users\iamsa\Downloads\etp.csv" Analyze this file and give me report in 10 points only
+      /doc C:\data\report.pdf Summarize this document
+    Returns (filepath, user_prompt)
+    """
+    rest = rest.strip()
+    if not rest:
+        return "", ""
+
+    # Quoted path handling
+    if rest.startswith('"'):
+        end_idx = rest.find('"', 1)
+        if end_idx != -1:
+            filepath = rest[1:end_idx].strip()
+            prompt = rest[end_idx + 1:].strip()
+            return os.path.normpath(filepath), prompt
+    elif rest.startswith("'"):
+        end_idx = rest.find("'", 1)
+        if end_idx != -1:
+            filepath = rest[1:end_idx].strip()
+            prompt = rest[end_idx + 1:].strip()
+            return os.path.normpath(filepath), prompt
+
+    # Unquoted path handling: try matching longest valid file path from tokens
+    tokens = rest.split(" ")
+    for end in range(len(tokens), 0, -1):
+        candidate = " ".join(tokens[:end]).strip('"\'')
+        if os.path.isfile(os.path.normpath(candidate)):
+            filepath = os.path.normpath(candidate)
+            prompt = " ".join(tokens[end:]).strip()
+            return filepath, prompt
+
+    # Fallback splitting on first space
+    parts = rest.split(" ", 1)
+    filepath = os.path.normpath(parts[0].strip('"\''))
+    prompt = parts[1].strip() if len(parts) > 1 else ""
+    return filepath, prompt
+
+
+def handle_doc(raw_arg: str):
+    """Ingest a file into the RAG vector knowledge base with pre-validation and verbose logging.
+
+    Returns (filepath, user_prompt) on success, or (None, None) on failure.
+    """
+    filepath, prompt = parse_doc_command(raw_arg)
+
+    if not filepath:
+        console.print("  ❌ [bold red]Ingestion failed: File not found[/bold red] (no path given)\n")
+        return None, None
+
+    # Pre-ingestion validation
+    try:
+        from rag.loaders import validate_file_pre_ingestion
+        validate_file_pre_ingestion(filepath)
+    except Exception as val_err:
+        err_msg = str(val_err)
+        console.print(f"  ❌ [bold red]Ingestion failed:[/bold red] {err_msg}")
+        console.print(f"  [dim]Debug Exception details:\n{traceback.format_exc().strip()}[/dim]\n")
+        return None, None
+
+    stage("📂 [RAG Ingest]", f"Indexing [bold yellow]{os.path.basename(filepath)}[/bold yellow] into knowledge base...", style="bold green")
     console.print("-" * 65, style="dim")
     start = time.time()
     try:
         from rag.pipeline import ingest_path as _ingest
-        result  = run_with_spinner(
-            ["Loading file...", "Splitting into chunks...", "Embedding and indexing..."],
-            lambda: _ingest(path, replace_existing=True),
+        result = run_with_spinner(
+            ["Validating file...", "Loading & parsing document...", "Splitting into chunks...", "Embedding and indexing..."],
+            lambda: _ingest(filepath, replace_existing=True),
         )
         elapsed = round(time.time() - start, 2)
-        chunks  = result.get("chunks_indexed", 0)
-        docs    = result.get("documents_loaded", 0)
-        console.print("-" * 65, style="dim")
-        stage(
-            "✅ [Ingested]",
-            f"[bold green]{os.path.basename(path)}[/bold green] → "
-            f"[yellow]{docs}[/yellow] doc(s), [yellow]{chunks}[/yellow] chunk(s) in {elapsed}s",
-            style="bold green",
+
+        loader_name = result.get("loader", "DocumentLoader")
+        rows_loaded = result.get("rows_loaded", result.get("documents_loaded", 0))
+        chunks_gen  = result.get("chunks_generated", result.get("chunks_indexed", 0))
+        embed_count = result.get("embeddings_created", chunks_gen)
+
+        verbose_log = (
+            "[DOC]\n"
+            "Path detected:\n"
+            f"{filepath}\n\n"
+            "File exists: TRUE\n\n"
+            "Loader selected:\n"
+            f"{loader_name}\n\n"
+            "Rows loaded:\n"
+            f"{rows_loaded}\n\n"
+            "Chunks generated:\n"
+            f"{chunks_gen}\n\n"
+            "Embeddings created:\n"
+            f"{embed_count}\n\n"
+            "Stored in vector DB:\n"
+            "SUCCESS"
         )
-        console.print("  [dim]Now ask: /rag <question about this document>[/dim]\n")
+        console.print(Panel(verbose_log, title="[bold green]Document Ingestion Log[/bold green]", border_style="green", padding=(1, 2)))
+        console.print("-" * 65, style="dim")
+
+        return filepath, prompt
     except Exception as exc:
-        console.print(f"  ❌ [bold red]Ingestion failed:[/bold red] {exc}\n")
+        err_str = str(exc)
+        if hasattr(exc, "__cause__") and exc.__cause__:
+            err_str = str(exc.__cause__)
+        if err_str.startswith("RuntimeError:"):
+            err_str = err_str.replace("RuntimeError:", "").strip()
+        console.print(f"  ❌ [bold red]Ingestion failed:[/bold red] {err_str}")
+        console.print(f"  [dim]Debug Exception details:\n{traceback.format_exc().strip()}[/dim]\n")
+        return None, None
+
 
 
 def handle_kb_stats():
@@ -727,15 +856,15 @@ def handle_history():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    # Sessions stored only in PostgreSQL — no local JSON or chat_sessions/ folder needed
+    # Sessions are stored locally in SQLite; no separate database service is needed.
 
-    # ── Initialise PostgreSQL ────────────────────────────────────────────────
+    # ── Initialise SQLite ───────────────────────────────────────────────────
     db_ok = db.init_db()
     if db_ok:
-        stage("🗄️  [Database]", "PostgreSQL session store connected and ready.", style="bold green")
+        stage("🗄️  [Database]", "SQLite session store connected and ready.", style="bold green")
     else:
-        stage("⚠️  [Database]", f"PostgreSQL unavailable — sessions will NOT be saved. ({db.get_error()[:80]})", style="bold red")
-        console.print("  [dim]Check db_config.json and ensure PostgreSQL is running on localhost.[/dim]")
+        stage("⚠️  [Database]", f"SQLite unavailable — sessions will NOT be saved. ({db.get_error()[:80]})", style="bold red")
+        console.print("  [dim]Check write permissions in the project directory.[/dim]")
 
     # ── Session name (human-readable, used as DB primary key) ────────────────
     session_name = datetime.datetime.now().strftime("session_%Y-%m-%d_%H-%M-%S")
@@ -780,6 +909,36 @@ def main():
                 print()
                 continue
 
+            # ── Inject active file content if referenced ──────────────────────
+            # Only inject content when a file is active AND the query is clearly about it
+            trigger_phrases = [
+                "this file", "this document", "this sheet", "this pdf",
+                "the uploaded file", "the file", "uploaded",
+                "analyze this", "summarize this", "from this", "in this file",
+                "in this document", "the data in", "this data", "the data",
+                "the dataset", "about this data", "from the data", "analyze this data",
+                "summarize this data", "explain this data",
+            ]
+            has_data_ref = any(phrase in query.lower() for phrase in trigger_phrases)
+
+            if current_file_path and current_file_content and has_data_ref:
+                query += f"\n\n--- Ingested Content of {os.path.basename(current_file_path)} ---\n{current_file_content}\n--- End of file content ---"
+                stage("📎 [Attachment]", f"Attached content from [yellow]{os.path.basename(current_file_path)}[/yellow] to prompt", style="dim")
+            elif has_data_ref and not current_file_content:
+                # If active file not in RAM, retrieve relevant knowledge base context
+                try:
+                    from rag.vectorstore import get_vector_store
+                    store = get_vector_store()
+                    if store._collection.count() > 0:
+                        stage("🔍 [RAG Context]", "Active file not in RAM, retrieving context from knowledge base...", style="dim cyan")
+                        from rag.pipeline import answer as _rag_answer
+                        rag_res = _rag_answer(query)
+                        rag_ans = rag_res.get("answer", "")
+                        if rag_ans and "couldn't find sufficient information" not in rag_ans.lower():
+                            query += f"\n\n--- Retrieved Knowledge Base Context ---\n{rag_ans}\n--- End of context ---"
+                except Exception:
+                    pass
+
             # ── List generated files ──────────────────────────────────────────
             if query.lower() in ["/files", "files", "/ls", "ls"]:
                 handle_list_files()
@@ -806,25 +965,70 @@ def main():
                 handle_history()
                 continue
 
-            # ── Inject active file content if referenced ──────────────────────
-            if current_file_path and current_file_content:
-                trigger_phrases = [
-                    "this file", "this document", "this sheet", "this pdf",
-                    "the uploaded file", "the data", "the file", "uploaded",
-                ]
-                if any(phrase in query.lower() for phrase in trigger_phrases):
-                    query += f"\n\n--- Ingested Content of {os.path.basename(current_file_path)} ---\n{current_file_content}\n--- End of file content ---"
-                    stage("📎 [Attachment]", f"Attached content from [yellow]{os.path.basename(current_file_path)}[/yellow] to prompt", style="dim")
+            # ── Support /ask prefix ──────────────────────────────────────────
+            if query.startswith("/ask "):
+                query = query[5:].strip()
+            elif query.lower() == "/ask":
+                console.print("  [dim]Usage: /ask <your question or prompt>[/dim]\n")
+                continue
+
+
 
             # ── Command routing ───────────────────────────────────────────────
-            if query.startswith("/rag "):
-                handle_rag(query[5:].strip())
-            elif query.lower() == "/rag":
-                console.print("  [dim]Usage: /rag <question>[/dim]\n")
-            elif query.startswith("/doc "):
-                handle_doc(query[5:].strip())
-            elif query.lower() == "/doc":
-                console.print("  [dim]Usage: /doc <file path>[/dim]\n")
+            if query.startswith("/rag ") or query.lower() == "/rag":
+                rest = query[5:].strip() if query.startswith("/rag ") else ""
+                if not rest:
+                    console.print("  [dim]Usage: /rag <question>  or  /rag <file path> [optional prompt][/dim]\n")
+                else:
+                    is_file, filepath, user_prompt = is_file_path_arg(rest)
+                    if is_file:
+                        doc_path, prompt = handle_doc(rest)
+                        if doc_path:
+                            current_file_path = doc_path
+                            try:
+                                from file_readers import process_file
+                                res = process_file(doc_path)
+                                if res and not res.startswith("Error:"):
+                                    current_file_content = res
+                            except Exception:
+                                pass
+
+                            if prompt:
+                                console.print(f"  💬 [bold cyan]Executing prompt:[/bold cyan] [yellow]{prompt}[/yellow]\n")
+                                prompt_to_run = prompt
+                                if current_file_path and current_file_content:
+                                    prompt_to_run += f"\n\n--- Ingested Content of {os.path.basename(current_file_path)} ---\n{current_file_content}\n--- End of file content ---"
+                                ask_anything(prompt_to_run)
+                            else:
+                                console.print("  ✅ [bold green]File indexed into RAG KB & active in session![/bold green]\n  [dim]You can now ask questions directly (e.g. [cyan]analyze this data in around 10 points[/cyan]) or search via [cyan]/rag <question>[/cyan].[/dim]\n")
+                    else:
+                        handle_rag(rest)
+
+            elif query.startswith("/doc ") or query.lower() == "/doc":
+                rest = query[5:].strip() if query.startswith("/doc ") else ""
+                if not rest:
+                    console.print("  [dim]Usage: /doc <file path> [optional prompt][/dim]\n")
+                else:
+                    doc_path, user_prompt = handle_doc(rest)
+                    if doc_path:
+                        current_file_path = doc_path
+                        try:
+                            from file_readers import process_file
+                            res = process_file(doc_path)
+                            if res and not res.startswith("Error:"):
+                                current_file_content = res
+                        except Exception:
+                            pass
+
+                        if user_prompt:
+                            console.print(f"  💬 [bold cyan]Executing prompt:[/bold cyan] [yellow]{user_prompt}[/yellow]\n")
+                            prompt_to_run = user_prompt
+                            if current_file_path and current_file_content:
+                                prompt_to_run += f"\n\n--- Ingested Content of {os.path.basename(current_file_path)} ---\n{current_file_content}\n--- End of file content ---"
+                            ask_anything(prompt_to_run)
+                        else:
+                            console.print("  ✅ [bold green]File indexed into RAG KB & active in session![/bold green]\n  [dim]You can now ask questions directly (e.g. [cyan]analyze this data in around 10 points[/cyan]) or search via [cyan]/rag <question>[/cyan].[/dim]\n")
+
             elif query.startswith("/img "):
                 rest = query[5:].strip()
                 img_path, q_text = parse_image_command(rest)
@@ -853,7 +1057,29 @@ def main():
                 img_path, q_text = parse_image_command(rest)
                 handle_image(img_path, q_text)
             else:
-                ask_anything(query)
+                # Check if raw file path was pasted without command
+                is_file, filepath, user_prompt = is_file_path_arg(query)
+                if is_file and (os.path.isfile(filepath) or not " " in filepath):
+                    doc_path, prompt = handle_doc(query)
+                    if doc_path:
+                        current_file_path = doc_path
+                        try:
+                            from file_readers import process_file
+                            res = process_file(doc_path)
+                            if res and not res.startswith("Error:"):
+                                current_file_content = res
+                        except Exception:
+                            pass
+                        if prompt:
+                            console.print(f"  💬 [bold cyan]Executing prompt:[/bold cyan] [yellow]{prompt}[/yellow]\n")
+                            prompt_to_run = prompt
+                            if current_file_path and current_file_content:
+                                prompt_to_run += f"\n\n--- Ingested Content of {os.path.basename(current_file_path)} ---\n{current_file_content}\n--- End of file content ---"
+                            ask_anything(prompt_to_run)
+                        else:
+                            console.print("  ✅ [bold green]File indexed into RAG KB & active in session![/bold green]\n  [dim]You can now ask questions directly (e.g. [cyan]analyze this data in around 10 points[/cyan]) or search via [cyan]/rag <question>[/cyan].[/dim]\n")
+                else:
+                    ask_anything(query)
 
         except KeyboardInterrupt:
             console.print("\n\n[bold cyan]👋 Session paused. Type exit or Ctrl+C again to quit.[/bold cyan]\n")

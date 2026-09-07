@@ -47,7 +47,7 @@ When running, the server terminal provides full real-time visibility with struct
 
 ---
 
-### Step 3: Run the Interactive Terminal Client (Frontend)
+### Step 3: Run the Interactive Terminal Client
 Open another terminal window and start the interactive client:
 ```powershell
 py ask.py
@@ -88,10 +88,13 @@ This opens an interactive shell with an automated capability showcase, command m
 | `POST` | `/ask/agent` | LangGraph agent endpoint with structured tool calling |
 | `POST` | `/reset` | Reset conversational memory |
 | `GET` | `/docs` | Interactive Swagger UI API documentation |
+| `GET` | `/capabilities` | Offline runtime and optional tool availability |
+| `POST` | `/knowledge-base/ingest` | Index local document paths into Chroma |
+| `GET` | `/files/{filename}` | Download a generated artifact |
 
 ---
 
 ## 🛡️ Privacy & Sovereign Security
 
 - **Software Offline Guard (`offline_guard.py`)**: Intercepts outbound socket network calls to ensure no prompts or documents leak to external networks.
-- **Local Persistence**: All chat history and transcripts are saved strictly on your local disk under `chat_sessions/`.
+- **Local Persistence**: Session and project memory are saved in local SQLite; generated documents are saved under `generated_files/`.

@@ -30,12 +30,57 @@ SESSION PERSISTENCE
 
 import json
 import os
+import re
 import ollama
 
 import db as _db
 
 _CURRENT_SESSION_NAME: str = ""
 _LOG_CALLBACK = None
+
+
+def _find_embedded_tool_calls(text: str) -> list[tuple[str, dict]]:
+    """Detect tool calls that models emitted as plain JSON text instead of native tool calls."""
+    if not text:
+        return []
+    results = []
+    # Match markdown code block with {"name": "...", "arguments": ...}
+    pattern = re.compile(r'```(?:json)?\s*(\{\s*"name"\s*:\s*"[^"]+".*?\})\s*```', re.DOTALL)
+    for block in pattern.findall(text):
+        try:
+            data = json.loads(block)
+            name = data.get("name")
+            args = data.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            if name and isinstance(args, dict):
+                results.append((name, args))
+        except Exception:
+            continue
+    if not results:
+        unfenced = re.findall(
+            r'(\{\s*"name"\s*:\s*"(?:generate_pdf_from_text|create_file|write_docx|merge_pdfs|split_pdf|rotate_pdf_pages|ingest_file|search_documents)"\s*,\s*"arguments"\s*:\s*\{.*?\}(?:\s*,\s*"filename"\s*:\s*"[^"]*")?\s*\})',
+            text,
+            re.DOTALL,
+        )
+        for block in unfenced:
+            try:
+                data = json.loads(block)
+                name = data.get("name")
+                args = data.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                if name and isinstance(args, dict):
+                    results.append((name, args))
+            except Exception:
+                continue
+    return results
 
 
 def start_new_session(session_name: str):
@@ -305,6 +350,18 @@ def get_full_answer(model: str, query: str) -> str:
 
     answer = _get(response, "message", "content") or ""
 
+    # Fallback: if the model emitted a JSON tool call block in text instead of native tool_calls
+    if not tool_calls:
+        embedded = _find_embedded_tool_calls(answer)
+        for func_name, args in embedded:
+            if func_name in TOOL_FUNCTIONS:
+                try:
+                    result = TOOL_FUNCTIONS[func_name](**args)
+                except Exception as e:
+                    result = f"Error running tool '{func_name}': {e}"
+                _log_event("tool_call", {"tool": func_name, "args": args, "result": str(result)})
+                answer += f"\n\n---\n🛠️ **Auto-executed tool** `{func_name}`:\n📄 {result}\n---"
+
     add_to_history("user",      query)
     add_to_history("assistant", answer)
     _log_event("model_done", {"model": model, "answer": answer})
@@ -380,6 +437,20 @@ def stream_answer(model: str, query: str):
             err = f"\n[Error in follow-up stream: {exc}]"
             yield err
             full_answer += err
+
+    elif not tool_calls:
+        # Fallback: check if the model emitted a JSON tool call block in text instead of native tool_calls
+        embedded = _find_embedded_tool_calls(full_answer)
+        for func_name, args in embedded:
+            if func_name in TOOL_FUNCTIONS:
+                yield f"\n\n[System: Auto-executing tool '{func_name}'...]\n"
+                try:
+                    result = TOOL_FUNCTIONS[func_name](**args)
+                except Exception as e:
+                    result = f"Error running tool '{func_name}': {e}"
+                _log_event("tool_call", {"tool": func_name, "args": args, "result": str(result)})
+                yield f"\n---\n🛠️ **Auto-executed tool** `{func_name}`:\n📄 {result}\n---\n"
+                full_answer += f"\n\n[Auto-executed '{func_name}': {result}]"
 
     add_to_history("user",      query)
     add_to_history("assistant", full_answer)

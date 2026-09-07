@@ -26,10 +26,10 @@ MAX_CONTEXT_DOCS  = int(os.getenv("RAG_MAX_CONTEXT_DOCS",   "6"))
 CHUNK_SIZE        = int(os.getenv("RAG_CHUNK_SIZE",         "900"))
 CHUNK_OVERLAP     = int(os.getenv("RAG_CHUNK_OVERLAP",      "150"))
 
-ENABLE_MULTI_QUERY       = os.getenv("RAG_ENABLE_MULTI_QUERY",       "true").lower()  == "true"
+ENABLE_MULTI_QUERY       = os.getenv("RAG_ENABLE_MULTI_QUERY",       "false").lower() == "true"
 ENABLE_SEMANTIC_SPLITTER = os.getenv("RAG_ENABLE_SEMANTIC_SPLITTER", "false").lower() == "true"
 # Query expansion: LLM rewrites the user query into 2 variants before retrieval
-ENABLE_QUERY_EXPANSION   = os.getenv("RAG_QUERY_EXPANSION",          "true").lower()  == "true"
+ENABLE_QUERY_EXPANSION   = os.getenv("RAG_QUERY_EXPANSION",          "false").lower() == "true"
 
 # The application can later pass RBAC filters into ingest/query without changing
 # the vector-store API.

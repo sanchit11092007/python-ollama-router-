@@ -29,37 +29,37 @@ def choose_strategy(query: str) -> str:
     return "similarity"
 
 
-def _base_retriever(strategy: str):
+def _base_retriever(strategy: str, top_k: int = TOP_K):
     store = get_vector_store()
     if strategy == "mmr":
-        return store.as_retriever(search_type="mmr", search_kwargs={"k": TOP_K, "fetch_k": FETCH_K})
-    return store.as_retriever(search_type="similarity", search_kwargs={"k": TOP_K})
+        return store.as_retriever(search_type="mmr", search_kwargs={"k": top_k, "fetch_k": FETCH_K})
+    return store.as_retriever(search_type="similarity", search_kwargs={"k": top_k})
 
 
-def retrieve(query: str, strategy: str | None = None, access_filter: dict | None = None) -> tuple[list[Document], str]:
+def retrieve(query: str, strategy: str | None = None, access_filter: dict | None = None, top_k: int = TOP_K) -> tuple[list[Document], str]:
     strategy = strategy or choose_strategy(query)
     try:
         if strategy == "multi_query" and ENABLE_MULTI_QUERY:
             from langchain_community.retrievers import MultiQueryRetriever
-            base = _base_retriever("mmr")
+            base = _base_retriever("mmr", top_k)
             if access_filter:
-                base = get_vector_store().as_retriever(search_type="mmr", search_kwargs={"k": TOP_K, "fetch_k": FETCH_K, "filter": access_filter})
+                base = get_vector_store().as_retriever(search_type="mmr", search_kwargs={"k": top_k, "fetch_k": FETCH_K, "filter": access_filter})
             retriever = MultiQueryRetriever.from_llm(retriever=base, llm=get_query_llm())
         else:
-            retriever = _base_retriever(strategy)
+            retriever = _base_retriever(strategy, top_k)
             if access_filter:
                 retriever = get_vector_store().as_retriever(
                     search_type="mmr" if strategy == "mmr" else "similarity",
-                    search_kwargs={"k": TOP_K, **({"fetch_k": FETCH_K} if strategy == "mmr" else {}), "filter": access_filter},
+                    search_kwargs={"k": top_k, **({"fetch_k": FETCH_K} if strategy == "mmr" else {}), "filter": access_filter},
                 )
         docs = retriever.invoke(query)
         return docs[:MAX_CONTEXT_DOCS], strategy
     except Exception:
         # Reliability rule: advanced retrieval must never make RAG unavailable.
         try:
-            fallback = _base_retriever("similarity")
+            fallback = _base_retriever("similarity", top_k)
             if access_filter:
-                fallback = get_vector_store().as_retriever(search_type="similarity", search_kwargs={"k": TOP_K, "filter": access_filter})
+                fallback = get_vector_store().as_retriever(search_type="similarity", search_kwargs={"k": top_k, "filter": access_filter})
             return fallback.invoke(query)[:MAX_CONTEXT_DOCS], "similarity_fallback"
         except Exception:
             return [], "unavailable"
@@ -69,6 +69,7 @@ def retrieve_expanded(
     queries: list[str],
     strategy: str | None = None,
     access_filter: dict | None = None,
+    top_k: int = TOP_K,
 ) -> tuple[list[Document], str]:
     """
     Retrieve documents for multiple query variants and merge results,
@@ -84,7 +85,7 @@ def retrieve_expanded(
 
     for q in queries:
         try:
-            docs, strat = retrieve(q, strategy=strategy, access_filter=access_filter)
+            docs, strat = retrieve(q, strategy=strategy, access_filter=access_filter, top_k=top_k)
             last_strategy = strat
             for doc in docs:
                 key = hashlib.md5(doc.page_content.encode("utf-8", errors="replace")).hexdigest()

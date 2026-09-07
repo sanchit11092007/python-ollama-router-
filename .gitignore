@@ -27,6 +27,9 @@ chroma_db/
 
 # Chat session logs (personal data, not source code)
 chat_sessions/
+agent_otg.sqlite3
+agent_otg.sqlite3-shm
+agent_otg.sqlite3-wal
 
 # PostgreSQL credentials — NEVER commit this file
 db_config.json

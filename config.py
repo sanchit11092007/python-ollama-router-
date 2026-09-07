@@ -39,9 +39,9 @@ RAG_FETCH_K            = int(os.getenv("RAG_FETCH_K",        "20"))
 RAG_MAX_CONTEXT_DOCS   = int(os.getenv("RAG_MAX_CONTEXT_DOCS","6"))
 RAG_CHUNK_SIZE         = int(os.getenv("RAG_CHUNK_SIZE",     "900"))
 RAG_CHUNK_OVERLAP      = int(os.getenv("RAG_CHUNK_OVERLAP",  "150"))
-RAG_ENABLE_MULTI_QUERY       = os.getenv("RAG_ENABLE_MULTI_QUERY",       "true").lower()  == "true"
+RAG_ENABLE_MULTI_QUERY       = os.getenv("RAG_ENABLE_MULTI_QUERY",       "false").lower() == "true"
 RAG_ENABLE_SEMANTIC_SPLITTER = os.getenv("RAG_ENABLE_SEMANTIC_SPLITTER", "false").lower() == "true"
-RAG_QUERY_EXPANSION          = os.getenv("RAG_QUERY_EXPANSION",          "true").lower()  == "true"
+RAG_QUERY_EXPANSION          = os.getenv("RAG_QUERY_EXPANSION",          "false").lower() == "true"
 
 # ── PostgreSQL ─────────────────────────────────────────────────────────────────
 DB_HOST     = os.getenv("DB_HOST",     "localhost")

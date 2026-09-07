@@ -12,8 +12,8 @@ rich
 reportlab
 pdfplumber
 pypdf
+python-pptx
 langgraph
-psycopg2-binary
 
 # ── LangChain / RAG stack ─────────────────────────────────────────────────────
 langchain>=0.3
@@ -31,6 +31,8 @@ docx2txt               # used by langchain_community.document_loaders.Docx2txtLo
 # ── PDF generation (Markdown-aware) ───────────────────────────────────────────
 markdown
 xhtml2pdf
+pytesseract
+Pillow
 
 # ── Optional: semantic splitting (only needed if RAG_ENABLE_SEMANTIC_SPLITTER=true)
 # langchain-experimental

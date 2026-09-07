@@ -1,5 +1,6 @@
 import os
 import json
+from artifacts import OUTPUT_DIR, SUPPORTED_FORMATS, create_artifact
 
 def _clean_path(path: str) -> str:
     """Clean surrounding quotes and whitespace from paths."""
@@ -12,24 +13,13 @@ def _clean_path(path: str) -> str:
 
 
 # ── write_docx tool ──────────────────────────────────────────────────────────
-from docx import Document
-
-_DOCX_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "generated_files")
-os.makedirs(_DOCX_OUTPUT_DIR, exist_ok=True)
+_OUTPUT_DIR = str(OUTPUT_DIR)
+_DOCX_OUTPUT_DIR = _OUTPUT_DIR
 
 
 def write_docx(title: str, content: str, filename: str = "output.docx") -> str:
-    safe_name = os.path.basename(_clean_path(filename))
-    if not safe_name.lower().endswith(".docx"):
-        safe_name += ".docx"
-    output_path = os.path.join(_DOCX_OUTPUT_DIR, safe_name)
-    doc = Document()
-    doc.add_heading(title, level=1)
-    for paragraph in content.split("\n\n"):
-        if paragraph.strip():
-            doc.add_paragraph(paragraph)
-    doc.save(output_path)
-    return f"Saved document to {output_path}"
+    artifact = create_artifact(title, content, "docx", filename)
+    return f"Saved document to {artifact.path}"
 
 
 # ── RAG tools ────────────────────────────────────────────────────────────────
@@ -126,6 +116,22 @@ def extract_pdf_text(pdf_path: str) -> str:
         return f"Error reading PDF: {exc}"
 
 
+def ocr_image(image_path: str) -> str:
+    """Extract text from a local image using a locally installed Tesseract runtime."""
+    path = _clean_path(image_path)
+    if not os.path.isfile(path):
+        return f"Error: file not found - {path}"
+    try:
+        import pytesseract
+        from PIL import Image
+        text = pytesseract.image_to_string(Image.open(path)).strip()
+        return text or "No readable text was found in the image."
+    except ImportError:
+        return "OCR unavailable. Install pytesseract and the local Tesseract OCR runtime."
+    except Exception as exc:
+        return f"OCR failed: {exc}"
+
+
 def merge_pdfs(pdf_paths, output_filename: str = "merged.pdf") -> str:
     from pypdf import PdfWriter
     if isinstance(pdf_paths, str):
@@ -144,10 +150,10 @@ def merge_pdfs(pdf_paths, output_filename: str = "merged.pdf") -> str:
         writer = PdfWriter()
         for path in cleaned_paths:
             writer.append(path)
-        safe_name = os.path.basename(_clean_path(output_filename))
+        safe_name = os.path.basename(_clean_path(output_filename or "merged.pdf")) or "merged.pdf"
         if not safe_name.lower().endswith(".pdf"):
             safe_name += ".pdf"
-        output_path = os.path.join(_DOCX_OUTPUT_DIR, safe_name)
+        output_path = os.path.join(_OUTPUT_DIR, safe_name)
         with open(output_path, "wb") as f:
             writer.write(f)
         return f"Merged {len(cleaned_paths)} PDF(s) into {output_path}"
@@ -156,30 +162,22 @@ def merge_pdfs(pdf_paths, output_filename: str = "merged.pdf") -> str:
 
 
 def generate_pdf_from_text(title: str, content: str, filename: str = "output.pdf") -> str:
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet
-    safe_name = os.path.basename(_clean_path(filename))
-    if not safe_name.lower().endswith(".pdf"):
-        safe_name += ".pdf"
-    output_path = os.path.join(_DOCX_OUTPUT_DIR, safe_name)
-
-    doc = SimpleDocTemplate(output_path)
-    styles = getSampleStyleSheet()
-    story = [Paragraph(title, styles["Title"]), Spacer(1, 12)]
-
-    for paragraph in content.split("\n\n"):
-        if paragraph.strip():
-            story.append(Paragraph(paragraph.strip(), styles["Normal"]))
-            story.append(Spacer(1, 12))
-
-    doc.build(story)
-    return f"Saved PDF to {output_path}"
+    artifact = create_artifact(title, content, "pdf", filename)
+    return f"Saved PDF to {artifact.path}"
 
 
-def split_pdf(pdf_path: str, output_folder: str) -> str:
+def create_file(title: str, content: str, file_format: str, filename: str = "output") -> dict:
+    """Create and validate a local PDF, DOCX, TXT, MD, PPTX, XLSX, CSV, or JSON artifact."""
+    artifact = create_artifact(title, content, file_format, filename)
+    return artifact.as_dict()
+
+
+def split_pdf(pdf_path: str, output_folder: str = "split_pages") -> str:
     from pypdf import PdfReader, PdfWriter
     clean_p = _clean_path(pdf_path)
-    clean_out = _clean_path(output_folder)
+    clean_out = _clean_path(output_folder or "split_pages")
+    if not os.path.isabs(clean_out):
+        clean_out = os.path.join(_OUTPUT_DIR, clean_out)
     if not os.path.isfile(clean_p):
         return f"Error: file not found - {clean_p}"
     os.makedirs(clean_out, exist_ok=True)
@@ -197,7 +195,7 @@ def split_pdf(pdf_path: str, output_folder: str) -> str:
         return f"Error splitting PDF: {exc}"
 
 
-def rotate_pdf_pages(pdf_path: str, degrees, output_filename: str) -> str:
+def rotate_pdf_pages(pdf_path: str, degrees: int = 90, output_filename: str = "rotated.pdf") -> str:
     from pypdf import PdfReader, PdfWriter
     clean_p = _clean_path(pdf_path)
     if not os.path.isfile(clean_p):
@@ -210,10 +208,10 @@ def rotate_pdf_pages(pdf_path: str, degrees, output_filename: str) -> str:
             page.rotate(deg)
             writer.add_page(page)
 
-        safe_name = os.path.basename(_clean_path(output_filename))
+        safe_name = os.path.basename(_clean_path(output_filename or "rotated.pdf")) or "rotated.pdf"
         if not safe_name.lower().endswith(".pdf"):
             safe_name += ".pdf"
-        output_path = os.path.join(_DOCX_OUTPUT_DIR, safe_name)
+        output_path = os.path.join(_OUTPUT_DIR, safe_name)
         with open(output_path, "wb") as f:
             writer.write(f)
         return f"Rotated pages by {deg} degrees, saved to {output_path}"
@@ -235,7 +233,6 @@ def get_pdf_page_count(pdf_path: str) -> int:
 
 # ── File listing ─────────────────────────────────────────────────────────────
 # Alias for backward-compatibility with ask.py's handle_list_files import
-_OUTPUT_DIR = _DOCX_OUTPUT_DIR
 
 
 def list_generated_files() -> str:
@@ -257,11 +254,13 @@ def list_generated_files() -> str:
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 TOOL_FUNCTIONS: dict = {
+    "create_file": create_file,
     "write_docx": write_docx,
     "search_documents": search_documents,
     "ingest_document": ingest_document,
     "ingest_file": ingest_file,
     "extract_pdf_text": extract_pdf_text,
+    "ocr_image": ocr_image,
     "merge_pdfs": merge_pdfs,
     "generate_pdf_from_text": generate_pdf_from_text,
     "split_pdf": split_pdf,
@@ -271,6 +270,23 @@ TOOL_FUNCTIONS: dict = {
 
 
 TOOL_SCHEMAS: list = [
+    {"type": "function", "function": {
+        "name": "ocr_image",
+        "description": "Extract readable text from a local image using offline Tesseract OCR.",
+        "parameters": {"type": "object", "properties": {
+            "image_path": {"type": "string", "description": "Path to a PNG, JPEG, or WEBP image"},
+        }, "required": ["image_path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "create_file",
+        "description": "Create and validate a local PDF, DOCX, TXT, Markdown, PPTX, XLSX, CSV, or JSON artifact.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string", "description": "Document title"},
+            "content": {"type": "string", "description": "Complete content for the file"},
+            "file_format": {"type": "string", "enum": ["pdf", "docx", "txt", "md", "pptx", "xlsx", "csv", "json"]},
+            "filename": {"type": "string", "description": "Output filename"},
+        }, "required": ["title", "content", "file_format"]},
+    }},
     {"type": "function", "function": {
         "name": "write_docx",
         "description": "Write a Word (.docx) document with a title and body content and save it to disk.",

@@ -28,6 +28,8 @@ if sys.platform == "win32":
 import json
 import time
 import datetime
+import importlib.util
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 
 from offline_guard import enable_offline_mode
@@ -35,7 +37,7 @@ enable_offline_mode()
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -133,13 +135,13 @@ router.set_log_callback(_router_event_listener)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Initialise PostgreSQL ───────────────────────────────────────────────
+    # ── Initialise local persistence ───────────────────────────────────────
     db_ok = db.init_db()
     if db_ok:
-        log_system("PostgreSQL session store: connected OK")
+        log_system("SQLite session store: connected OK")
     else:
-        log_err(f"PostgreSQL session store: UNAVAILABLE — {db.get_error()}")
-        log_system("Sessions will NOT be persisted. Check db_config.json.")
+        log_err(f"SQLite session store: UNAVAILABLE — {db.get_error()}")
+        log_system("Sessions will not be persisted.")
 
     # ── Session name ────────────────────────────────────────────────────
     session_name = datetime.datetime.now().strftime("server_session_%Y-%m-%d_%H-%M-%S")
@@ -204,6 +206,11 @@ class ImageQuestion(BaseModel):
     )
 
 
+class IngestRequest(BaseModel):
+    paths: list[str] = Field(..., min_length=1, max_length=50)
+    replace_existing: bool = True
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -223,7 +230,7 @@ def home():
             "/ask", "/ask/stream", "/ask/complex",
             "/ask/image", "/ask/agent",
             "/reset", "/health", "/tools",
-            "/sessions", "/docs",
+            "/sessions", "/knowledge-base/ingest", "/files/{filename}", "/docs",
         ],
     }
 
@@ -237,6 +244,30 @@ def health():
     except Exception as exc:
         log_err(f"Health check failed to reach Ollama: {exc}")
         return {"ollama": "disconnected"}
+
+
+@app.get("/capabilities")
+def capabilities():
+    """Report available offline runtimes without contacting any cloud service."""
+    optional = {name: importlib.util.find_spec(name) is not None for name in ("pytesseract", "pyttsx3", "speech_recognition")}
+    return {
+        "offline": True,
+        "artifact_formats": ["pdf", "docx", "txt", "md", "pptx", "xlsx", "csv", "json"],
+        "optional": optional,
+    }
+
+
+@app.post("/knowledge-base/ingest")
+def ingest_knowledge_base(request: IngestRequest):
+    try:
+        from rag.pipeline import ingest_paths
+        return ingest_paths(request.paths, replace_existing=request.replace_existing)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Local file not found: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Knowledge base unavailable: {exc}")
 
 
 @app.post("/reset")
@@ -537,12 +568,15 @@ def ask_agent(q: Question):
             )
 
         history = get_history()
-        log_model("Running LangGraph agent (Node pipeline: classify -> tools? -> classify -> ... -> respond)...")
+        log_model("Running supervised LangGraph workflow...")
         result = run_agent(q.query, history=history)
 
         needs_tool = result.get("needs_tool", False)
         tool_log   = result.get("tool_log", [])
         answer     = result.get("final_answer", "").strip()
+        artifact   = result.get("artifact")
+        if artifact:
+            artifact = {**artifact, "download_url": f"/files/{quote(artifact['filename'])}"}
 
         if needs_tool and tool_log:
             for t in tool_log:
@@ -563,6 +597,10 @@ def ask_agent(q: Question):
             "needs_tool":   needs_tool,
             "tool_log":     tool_log,
             "answer":       answer,
+            "progress":     result.get("events", []),
+            "artifact":     artifact,
+            "errors":       result.get("errors", []),
+            "run_id":       result.get("run_id"),
         }
     except HTTPException:
         raise
@@ -587,13 +625,24 @@ def list_tools():
     }
 
 
+@app.get("/files/{filename}")
+def download_generated_file(filename: str):
+    """Download a validated artifact created by the agent."""
+    try:
+        from artifacts import resolve_artifact
+        path = resolve_artifact(filename)
+        return FileResponse(path, filename=path.name)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Generated file not found")
+
+
 @app.get("/sessions")
 def list_sessions():
-    """List all saved chat sessions stored in PostgreSQL."""
+    """List all locally persisted chat sessions."""
     if not db.is_ready():
         raise HTTPException(
             status_code=503,
-            detail=f"PostgreSQL unavailable: {db.get_error()}"
+            detail=f"Local session store unavailable: {db.get_error()}"
         )
     sessions = db.get_all_sessions(limit=50)
     return {
@@ -604,11 +653,11 @@ def list_sessions():
 
 @app.get("/sessions/{session_name}")
 def get_session_messages(session_name: str):
-    """Retrieve all messages for a specific session from PostgreSQL."""
+    """Retrieve all messages for a locally persisted session."""
     if not db.is_ready():
         raise HTTPException(
             status_code=503,
-            detail=f"PostgreSQL unavailable: {db.get_error()}"
+            detail=f"Local session store unavailable: {db.get_error()}"
         )
     messages = db.get_session_messages(session_name, limit=500)
     if not messages:

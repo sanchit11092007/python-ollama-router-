@@ -41,10 +41,29 @@ def _base_metadata(path: str) -> dict:
     }
 
 
+def validate_file_pre_ingestion(path: str) -> dict:
+    clean_p = os.path.normpath(str(path).strip().strip('"').strip("'"))
+    if not os.path.exists(clean_p):
+        raise FileNotFoundError(f"File not found: '{clean_p}'")
+    if not os.path.isfile(clean_p):
+        raise FileNotFoundError(f"Path is not a regular file: '{clean_p}'")
+    if not os.access(clean_p, os.R_OK):
+        raise PermissionError(f"Permission denied: cannot read file '{clean_p}'")
+    size = os.path.getsize(clean_p)
+    if size == 0:
+        raise ValueError(f"File is empty (0 bytes): '{clean_p}'")
+    ext = Path(clean_p).suffix.lower()
+    supported = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".webp"}
+    if ext not in supported:
+        raise ValueError(f"Unsupported format: '{ext}'. Supported extensions: {', '.join(sorted(supported))}")
+    return {"exists": True, "size": size, "extension": ext}
+
+
 def _load_pdf(path: str) -> list[Document]:
     from langchain_community.document_loaders import PyMuPDFLoader
     docs = PyMuPDFLoader(path).load()
     base = _base_metadata(path)
+    base["loader_name"] = "PyMuPDFLoader"
     out = []
     for i, d in enumerate(docs, 1):
         text = _clean_text(d.page_content)
@@ -59,6 +78,7 @@ def _load_docx(path: str) -> list[Document]:
     from langchain_community.document_loaders import Docx2txtLoader
     docs = Docx2txtLoader(path).load()
     base = _base_metadata(path)
+    base["loader_name"] = "Docx2txtLoader"
     return [
         Document(page_content=_clean_text(d.page_content), metadata={**base, **d.metadata, "content_type": "text"})
         for d in docs if _clean_text(d.page_content)
@@ -66,30 +86,100 @@ def _load_docx(path: str) -> list[Document]:
 
 
 def _load_text(path: str) -> list[Document]:
-    from langchain_community.document_loaders import TextLoader
-    docs = TextLoader(path, autodetect_encoding=True).load()
+    encodings = ["utf-8-sig", "utf-8", "latin1", "cp1252"]
+    content = None
+    last_err: Exception | None = None
+    for enc in encodings:
+        try:
+            with open(path, "r", encoding=enc) as f:
+                content = f.read()
+            break
+        except UnicodeDecodeError as err:
+            last_err = err
+            continue
+    if content is None:
+        raise ValueError(f"Text encoding error: {last_err}")
+    clean = _clean_text(content)
+    if not clean:
+        return []
     base = _base_metadata(path)
-    return [
-        Document(page_content=_clean_text(d.page_content), metadata={**base, "content_type": "text"})
-        for d in docs if _clean_text(d.page_content)
-    ]
+    base["loader_name"] = "TextLoader"
+    return [Document(page_content=clean, metadata={**base, "content_type": "text"})]
 
 
 def _load_json(path: str) -> list[Document]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    # Try multiple encodings to handle BOM or Latin-1 encoded JSON files.
+    encodings = ["utf-8-sig", "utf-8", "latin1", "cp1252"]
+    data = None
+    last_err: Exception | None = None
+    for enc in encodings:
+        try:
+            with open(path, "r", encoding=enc) as f:
+                data = json.load(f)
+            break
+        except (UnicodeDecodeError, json.JSONDecodeError) as err:
+            last_err = err
+            continue
+    if data is None:
+        raise ValueError(f"JSON loading error: {last_err}")
     text = json.dumps(data, ensure_ascii=False, indent=2)
-    return [Document(page_content=text, metadata={**_base_metadata(path), "content_type": "json"})]
+    base = _base_metadata(path)
+    base["loader_name"] = "JSONLoader"
+    return [Document(page_content=text, metadata={**base, "content_type": "json"})]
 
 
 def _load_csv(path: str) -> list[Document]:
-    from langchain_community.document_loaders import CSVLoader
-    docs = CSVLoader(path).load()
+    import pandas as pd
+    encodings = ["utf-8", "utf-8-sig", "latin1", "cp1252"]
+    df = None
+    last_err = None
+    used_enc = None
+
+    for enc in encodings:
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            used_enc = enc
+            break
+        except (UnicodeDecodeError, pd.errors.ParserError, Exception) as err:
+            last_err = err
+            continue
+
+    if df is None:
+        if isinstance(last_err, UnicodeDecodeError):
+            raise UnicodeDecodeError(
+                last_err.encoding or "utf-8",
+                last_err.object or b"",
+                last_err.start or 0,
+                last_err.end or 0,
+                f"Encoding error reading CSV file with utf-8, utf-8-sig, latin1, cp1252: {last_err}"
+            )
+        elif isinstance(last_err, pd.errors.ParserError):
+            raise ValueError(f"CSV parsing error: {last_err}")
+        else:
+            raise ValueError(f"CSV loading error: {last_err}")
+
     base = _base_metadata(path)
-    return [
-        Document(page_content=_clean_text(d.page_content), metadata={**base, **d.metadata, "content_type": "table"})
-        for d in docs if _clean_text(d.page_content)
-    ]
+    base["loader_name"] = "CSVLoader"
+    base["encoding"] = used_enc
+    df = df.dropna(how="all")
+    rows_count = len(df)
+    base["rows_loaded"] = rows_count
+
+    if df.empty:
+        return []
+
+    df = df.where(pd.notnull(df), "")
+    headers = [str(c) for c in df.columns]
+    out: list[Document] = []
+    for row_number, row in enumerate(df.itertuples(index=False, name=None), 2):
+        pairs = [f"{headers[i]}: {row[i]}" for i in range(len(headers)) if str(row[i]).strip()]
+        if pairs:
+            text = f"File: {base['file_name']}\nRow: {row_number}\n" + "\n".join(pairs)
+            out.append(Document(
+                page_content=text,
+                metadata={**base, "row": row_number, "content_type": "table"},
+            ))
+    return out
 
 
 def _load_excel(path: str) -> list[Document]:
@@ -98,12 +188,15 @@ def _load_excel(path: str) -> list[Document]:
     import pandas as pd
     workbook = pd.ExcelFile(path)
     base = _base_metadata(path)
+    base["loader_name"] = "ExcelLoader"
     out: list[Document] = []
+    total_rows = 0
     for sheet in workbook.sheet_names:
         df = pd.read_excel(path, sheet_name=sheet)
         df = df.dropna(how="all")
         if df.empty:
             continue
+        total_rows += len(df)
         df = df.where(pd.notnull(df), "")
         headers = [str(c) for c in df.columns]
         for row_number, row in enumerate(df.itertuples(index=False, name=None), 2):
@@ -114,6 +207,8 @@ def _load_excel(path: str) -> list[Document]:
                     page_content=text,
                     metadata={**base, "sheet": str(sheet), "row": row_number, "content_type": "table"},
                 ))
+    for d in out:
+        d.metadata["rows_loaded"] = total_rows
     return out
 
 
@@ -136,14 +231,15 @@ def _load_image(path: str) -> list[Document]:
         "role": "user", "content": prompt, "images": [b64]
     }])
     text = _clean_text(response["message"]["content"])
-    return [Document(page_content=text, metadata={**_base_metadata(path), "content_type": "image", "modality": "image"})] if text else []
+    base = _base_metadata(path)
+    base["loader_name"] = "ImageLoader"
+    return [Document(page_content=text, metadata={**base, "content_type": "image", "modality": "image"})] if text else []
 
 
 def load_file(path: str) -> list[Document]:
-    path = os.path.normpath(str(path).strip().strip('"').strip("'"))
-    if not os.path.isfile(path):
-        raise FileNotFoundError(path)
-    ext = Path(path).suffix.lower()
+    clean_path = os.path.normpath(str(path).strip().strip('"').strip("'"))
+    validate_file_pre_ingestion(clean_path)
+    ext = Path(clean_path).suffix.lower()
     loaders = {
         ".pdf": _load_pdf,
         ".docx": _load_docx,
@@ -159,8 +255,8 @@ def load_file(path: str) -> list[Document]:
         ".webp": _load_image,
     }
     if ext not in loaders:
-        raise ValueError(f"Unsupported file type: {ext}")
-    return loaders[ext](path)
+        raise ValueError(f"Unsupported format: '{ext}'")
+    return loaders[ext](clean_path)
 
 
 def load_files(paths: Iterable[str]) -> list[Document]:
@@ -168,3 +264,4 @@ def load_files(paths: Iterable[str]) -> list[Document]:
     for path in paths:
         all_docs.extend(load_file(path))
     return all_docs
+
