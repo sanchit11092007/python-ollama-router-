@@ -685,6 +685,37 @@ Message: {query}
 
     # Small local models occasionally return invalid JSON for an obviously
     # multi-part request.  Do not silently collapse it into one expensive task.
+    # 1. Numbered items (e.g. 1) ... 2) ... or 1. ... 2. ...)
+    if re.search(r"(?:^|\s)(?:1[\).]|first[,:])\s+.*?(?:\s+(?:2[\).]|second[,:]))\s+", query, re.I | re.DOTALL):
+        numbered_parts = [p.strip(" ,.;") for p in re.split(r"(?:^|\s+)\d+[\).]\s+", query) if p.strip(" ,.;")]
+        if len(numbered_parts) >= 2:
+            tasks = []
+            for part in numbered_parts:
+                category = _quick_classify(part) or "complex"
+                tasks.append({
+                    "label": part[:60],
+                    "task": part,
+                    "category": category,
+                    "model": pick_model(category),
+                })
+            return tasks
+
+    # 2. Bulleted items (e.g. - item 1 \n - item 2)
+    if re.search(r"(?:^|\n)\s*[-*•]\s+.*?\n\s*[-*•]\s+", query):
+        bullet_parts = [p.strip(" ,.;") for p in re.split(r"(?:^|\n)\s*[-*•]\s+", query) if p.strip(" ,.;")]
+        if len(bullet_parts) >= 2:
+            tasks = []
+            for part in bullet_parts:
+                category = _quick_classify(part) or "complex"
+                tasks.append({
+                    "label": part[:60],
+                    "task": part,
+                    "category": category,
+                    "model": pick_model(category),
+                })
+            return tasks
+
+    # 3. Delimited or conjoined action splitting
     parts = [p.strip(" ,.;") for p in re.split(
         r"(?:\n+|;|,\s*(?=(?:also\s+)?(?:write|create|generate|make|give|draft|explain)\b)|"
         r"\s+and\s+(?=(?:also\s+)?(?:write|create|generate|make|give|draft|explain)\b))",

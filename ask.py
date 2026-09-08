@@ -415,6 +415,22 @@ def print_help_guide():
 # SMART INTENT DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _is_multi_request(query: str) -> bool:
+    """True if query contains multiple distinct requests, numbered items, or mixed actions."""
+    q = (query or "").strip()
+    # Check for numbered items like 1) ... 2) ... or 1. ... 2. ...
+    if re.search(r"(?:^|\s)(?:1[\).]|first[,:])\s+.*?(?:\s+(?:2[\).]|second[,:]))\s+", q, re.I | re.DOTALL):
+        return True
+    # Check for bulleted list items
+    if re.search(r"(?:^|\n)\s*[-*•]\s+.*?\n\s*[-*•]\s+", q):
+        return True
+    # Check for multiple action verbs with distinct objects
+    actions = re.findall(r"\b(?:write|create|generate|make|draft|give|explain|summarize|compare|draw)\b", q, re.I)
+    if len(actions) >= 2 and any(sep in q.lower() for sep in [";", "\n", " and also ", ", also ", " and then ", " 2)", " 2."]):
+        return True
+    return _looks_like_mixed_file_request(q)
+
+
 def _detect_intent(query: str) -> str:
     """
     Detect the primary intent of a natural-language query WITHOUT requiring
@@ -425,6 +441,10 @@ def _detect_intent(query: str) -> str:
       'normal' → standard chat/code/reasoning
       'file'   → user pasted a file path (ingest it)
     """
+    # If the user has bundled multiple requests together, let the multi-task router decompose them
+    if _is_multi_request(query):
+        return "normal"
+
     q = query.lower().strip()
 
     # RAG search signals
@@ -592,7 +612,9 @@ def handle_multi(query):
         console.print("─" * 65, style="dim")
         # A file sub-task must use the deterministic artifact workflow even
         # when it originated inside a larger multi-part request.
-        if is_file_creation_request(task["task"]):
+        if re.search(r"\b(?:generate|create|make|draw)\s+(?:an?\s+)?image\b", task["task"], re.I):
+            handle_image_generation(task["task"])
+        elif is_file_creation_request(task["task"]):
             handle_agent(task["task"])
         else:
             stream_with_spinner(task["model"], task["task"])
@@ -620,6 +642,10 @@ def _looks_like_mixed_file_request(text: str) -> bool:
 
 def ask_anything(query, force_multi=False):
     """Main dispatcher for standard queries (non-agent, non-RAG)."""
+    if not force_multi and _is_multi_request(query):
+        handle_multi(query)
+        return
+
     if not force_multi and is_file_creation_request(query) and not _looks_like_mixed_file_request(query):
         handle_agent(query)
         return
