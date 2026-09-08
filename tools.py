@@ -390,6 +390,13 @@ def generate_pptx(title: str, slides_content: list, filename: str = "output.pptx
         from pptx.dml.color import RGBColor
         from pptx.enum.text import PP_ALIGN
 
+        if isinstance(slides_content, str):
+            try:
+                parsed = json.loads(slides_content)
+                if isinstance(parsed, list):
+                    slides_content = parsed
+            except Exception:
+                pass
         if not isinstance(title, str) or not isinstance(slides_content, list):
             return "❌ title must be text and slides_content must be a list."
         target_path = _valid_output_path(filename or "output.pptx", ".pptx")
@@ -514,6 +521,20 @@ def generate_xlsx(title: str, headers: list[str], rows: list[list], filename: st
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
 
+        if isinstance(headers, str):
+            try:
+                parsed = json.loads(headers)
+                if isinstance(parsed, list):
+                    headers = parsed
+            except Exception:
+                headers = [h.strip() for h in headers.split(",") if h.strip()]
+        if isinstance(rows, str):
+            try:
+                parsed = json.loads(rows)
+                if isinstance(parsed, list):
+                    rows = parsed
+            except Exception:
+                pass
         if not isinstance(title, str) or not isinstance(headers, list) or not isinstance(rows, list):
             return "❌ title must be text; headers and rows must be lists."
         target_path = _valid_output_path(filename or "output.xlsx", ".xlsx")

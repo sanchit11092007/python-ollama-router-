@@ -33,7 +33,6 @@ from reportlab.platypus import (
     Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle,
     HRFlowable, KeepTogether,
 )
-from reportlab.platypus.flowables import HRFlowable
 
 
 # ── Output directory: ~/Downloads/AgentOTG/ ───────────────────────────────────
