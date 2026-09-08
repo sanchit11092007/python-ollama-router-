@@ -571,6 +571,10 @@ def ask_agent(q: Question):
         log_model("Running supervised LangGraph workflow...")
         result = run_agent(q.query, history=history)
 
+        for event in result.get("events", []):
+            if event.get("stage") == "timing":
+                log_system(f"Agent timing — {event.get('detail')}")
+
         needs_tool = result.get("needs_tool", False)
         tool_log   = result.get("tool_log", [])
         answer     = result.get("final_answer", "").strip()

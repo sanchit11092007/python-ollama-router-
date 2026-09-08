@@ -41,10 +41,58 @@ def _base_metadata(path: str) -> dict:
     }
 
 
+def resolve_file_path(path: str) -> str:
+    """Resolve a user-provided file path, checking common locations if relative."""
+    if not path:
+        return ""
+    p = str(path).strip().strip("<>").strip()
+    if p.startswith("&"):
+        p = p[1:].strip()
+    if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
+        p = p[1:-1].strip()
+    if p.startswith("file:///"):
+        p = p[8:]
+    norm = os.path.normpath(p)
+    if os.path.isfile(norm):
+        return norm
+
+    # Check relative to cwd
+    cwd_candidate = os.path.normpath(os.path.join(os.getcwd(), norm))
+    if os.path.isfile(cwd_candidate):
+        return cwd_candidate
+
+    # Check in Downloads/AgentOTG
+    otg_dir = Path(os.environ.get("USERPROFILE", Path.home())) / "Downloads" / "AgentOTG"
+    otg_candidate = otg_dir / Path(norm).name
+    if otg_candidate.is_file():
+        return str(otg_candidate)
+
+    # Check in user's Downloads
+    dl_candidate = Path(os.environ.get("USERPROFILE", Path.home())) / "Downloads" / Path(norm).name
+    if dl_candidate.is_file():
+        return str(dl_candidate)
+
+    # Check in user's Documents
+    doc_candidate = Path(os.environ.get("USERPROFILE", Path.home())) / "Documents" / Path(norm).name
+    if doc_candidate.is_file():
+        return str(doc_candidate)
+
+    return norm
+
+
 def validate_file_pre_ingestion(path: str) -> dict:
-    clean_p = os.path.normpath(str(path).strip().strip('"').strip("'"))
+    clean_p = resolve_file_path(path)
     if not os.path.exists(clean_p):
-        raise FileNotFoundError(f"File not found: '{clean_p}'")
+        searched = [
+            clean_p,
+            str(Path(os.getcwd()) / Path(path).name),
+            str(Path(os.environ.get("USERPROFILE", Path.home())) / "Downloads" / "AgentOTG" / Path(path).name),
+            str(Path(os.environ.get("USERPROFILE", Path.home())) / "Downloads" / Path(path).name),
+        ]
+        raise FileNotFoundError(
+            f"File not found: '{clean_p}'\n"
+            f"Searched paths:\n  • " + "\n  • ".join(searched)
+        )
     if not os.path.isfile(clean_p):
         raise FileNotFoundError(f"Path is not a regular file: '{clean_p}'")
     if not os.access(clean_p, os.R_OK):
@@ -56,7 +104,7 @@ def validate_file_pre_ingestion(path: str) -> dict:
     supported = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".webp"}
     if ext not in supported:
         raise ValueError(f"Unsupported format: '{ext}'. Supported extensions: {', '.join(sorted(supported))}")
-    return {"exists": True, "size": size, "extension": ext}
+    return {"exists": True, "size": size, "extension": ext, "resolved_path": clean_p}
 
 
 def _load_pdf(path: str) -> list[Document]:
@@ -237,8 +285,8 @@ def _load_image(path: str) -> list[Document]:
 
 
 def load_file(path: str) -> list[Document]:
-    clean_path = os.path.normpath(str(path).strip().strip('"').strip("'"))
-    validate_file_pre_ingestion(clean_path)
+    val = validate_file_pre_ingestion(path)
+    clean_path = val["resolved_path"]
     ext = Path(clean_path).suffix.lower()
     loaders = {
         ".pdf": _load_pdf,

@@ -1,31 +1,26 @@
 """
-router.py - Decides which model(s) answer, and remembers the conversation.
+router.py - Smart multi-model router for Agent OTG
 
 MODELS
-    CODER_MODEL : code questions
-    MAIN_MODEL  : the "smart" 14b model -> essays, reasoning, explanations
-    FAST_MODEL  : the 7b model -> (a) makes the routing decision itself,
-                  (b) answers quick casual chit-chat
-    IMAGE_MODEL : vision model -> answers questions about images
+    CODER_MODEL : code questions — qwen2.5-coder
+    MAIN_MODEL  : complex reasoning, essays, analysis — qwen2.5:14b
+    FAST_MODEL  : quick answers, greetings, simple math — qwen2.5:7b
+    IMAGE_MODEL : vision analysis — qwen2.5vl:7b
 
-HOW A QUESTION FLOWS
-    1. classify_question() asks FAST_MODEL to decide category + whether
-       the message is actually multiple separate asks bundled together.
-       It also detects the special "code + explain" combo via
-       has_code_and_explain flag + keyword safety-net.
-    2. If has_code_and_explain is True, run_sequential_tasks() handles it:
-         - Step 1: CODER_MODEL generates the code (saved to shared HISTORY).
-         - Step 2: MAIN_MODEL reads that history and writes the explanation.
-    3. Otherwise, if multi-part, break_into_tasks() splits it independently.
-    4. get_full_answer() / stream_answer() actually run a model on a task.
+CLASSIFICATION — 5 categories (upgraded from 3):
+    "code"       → CODER_MODEL
+    "simple"     → FAST_MODEL  ← was under-used before
+    "complex"    → MAIN_MODEL
+    "rag_search" → FAST_MODEL (RAG handles the heavy lifting)
+    "agent_task" → handled by LangGraph agent pipeline
 
-MEMORY
-    HISTORY is a shared list of past turns, used so follow-up questions
-    have context. Fine for a single-user local demo.
+SMART ROUTING
+    The classifier now uses a richer prompt, length-based heuristics,
+    and keyword safety-nets to avoid sending simple questions to the
+    expensive 14b model.
 
 SESSION PERSISTENCE
-    All messages are stored in PostgreSQL (agent_otg database) via db.py.
-    Configure credentials in db_config.json.
+    All messages are stored in SQLite (agent_otg.sqlite3) via db.py.
 """
 
 import json
@@ -44,7 +39,6 @@ def _find_embedded_tool_calls(text: str) -> list[tuple[str, dict]]:
     if not text:
         return []
     results = []
-    # Match markdown code block with {"name": "...", "arguments": ...}
     pattern = re.compile(r'```(?:json)?\s*(\{\s*"name"\s*:\s*"[^"]+".*?\})\s*```', re.DOTALL)
     for block in pattern.findall(text):
         try:
@@ -86,8 +80,7 @@ def _find_embedded_tool_calls(text: str) -> list[tuple[str, dict]]:
 def start_new_session(session_name: str):
     """
     Called at startup to name the current session.
-    Creates the session record in PostgreSQL.
-    The session_name is a human-readable string (e.g. 'session_2026-09-07_10-30-00').
+    Creates the session record in the database.
     """
     global _CURRENT_SESSION_NAME
     _CURRENT_SESSION_NAME = session_name
@@ -118,7 +111,7 @@ def load_system_prompt() -> str:
         return "You are a helpful, honest, on-premise AI assistant for industrial/confidential work."
 
 
-# ─── Models (read from .env via config.py — swap without touching code) ──────────
+# ─── Models (read from .env via config.py — swap without touching code) ──────
 import config as _cfg
 CODER_MODEL = _cfg.CODER_MODEL
 MAIN_MODEL  = _cfg.MAIN_MODEL
@@ -126,28 +119,27 @@ FAST_MODEL  = _cfg.FAST_MODEL
 IMAGE_MODEL = _cfg.IMAGE_MODEL
 
 AVAILABLE_MODELS = {
-    "code":    CODER_MODEL,
-    "simple":  FAST_MODEL,
-    "complex": MAIN_MODEL,
-    "image":   IMAGE_MODEL,
+    "code":       CODER_MODEL,
+    "simple":     FAST_MODEL,
+    "complex":    MAIN_MODEL,
+    "rag_search": FAST_MODEL,   # RAG does the heavy work; model just formats
+    "agent_task": MAIN_MODEL,   # Agent tasks use main model for planning
+    "image":      IMAGE_MODEL,
 }
 
-# ─── Conversation memory ────────────────────────────────────────────────────────
+# ─── Conversation memory ─────────────────────────────────────────────────────
 HISTORY   = []
 MAX_TURNS = 12
 
 
 def add_to_history(role: str, content: str):
     HISTORY.append({"role": role, "content": content})
-    # Trim to keep only the last MAX_TURNS entries
     if len(HISTORY) > MAX_TURNS:
         del HISTORY[:len(HISTORY) - MAX_TURNS]
-
-    # Persist to PostgreSQL
     if _CURRENT_SESSION_NAME and _db.is_ready():
         ok = _db.save_message(_CURRENT_SESSION_NAME, role, content)
         if not ok:
-            print(f"[router] DB save failed for role={role} — message not persisted", flush=True)
+            print(f"[router] DB save failed for role={role}", flush=True)
 
 
 def get_history() -> list:
@@ -159,30 +151,38 @@ def clear_history():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Classify — which category, and is it multiple asks?
+# SMART CLASSIFIER — 5 categories with confidence-based routing
 # ══════════════════════════════════════════════════════════════════════════════
 
-CLASSIFY_PROMPT = """You are a routing assistant. Read the user's new question
-(and the short recent chat history, if any) and decide:
+CLASSIFY_PROMPT = """You are an intelligent routing assistant for Agent OTG.
+Read the user's message and classify it into EXACTLY one of 5 categories.
 
-1. category: ONE of
-   - "code"    -> writing, fixing, debugging, testing, or explaining code/scripts/SQL/functions
-   - "simple"  -> quick factual questions, greetings, small talk, easy one-line math
-   - "complex" -> anything needing real reasoning, explanation, essay writing, or multi-step thought
-2. is_multi_part: true if the message asks for TWO OR MORE clearly distinct things
-   (e.g. "write an essay on X AND give code for Y", "explain A and also list B").
-   false if it's really just one request.
-3. has_code_and_explain: true if the request combines BOTH a code-writing task AND
-   an explanation/walkthrough of that same code. Common signals:
-   - "give me code and explain how it works"
-   - "write a script and walk me through it"
-   - "create X and describe/detail/break down how it works"
-   false otherwise.
+CATEGORIES:
+- "code"       → Writing, debugging, fixing, or testing code, scripts, SQL, functions, APIs
+- "simple"     → Greetings, small talk, quick factual one-liners, easy math (< 8 words usually)
+- "complex"    → Essays, analysis, explanations, research questions, multi-step reasoning
+- "rag_search" → User wants to search, query, or ask about UPLOADED documents / knowledge base
+                 Signals: "what does the document say", "from my files", "search the KB",
+                 "what does the report say", "according to the uploaded", "find in docs",
+                 "what does it say about", "from the data", "in the file"
+- "agent_task" → User wants to CREATE or GENERATE a FILE (PDF, Word, Excel, CSV, PowerPoint)
+                 or needs multi-tool autonomous work
+                 Signals: "create a PDF", "generate a Word doc", "make a spreadsheet",
+                 "write a report and save it", "generate a file", "create an Excel sheet"
 
-Reply with ONLY this JSON, nothing else:
-{"category": "code" | "simple" | "complex", "is_multi_part": true | false, "has_code_and_explain": true | false, "reason": "one short sentence"}
+RULES:
+1. "simple" ONLY for: greetings (hi/hello/thanks), trivial math, very short factual questions
+2. "rag_search" when user references existing documents/files they've uploaded
+3. "agent_task" when user explicitly wants a FILE to be created/saved/exported
+4. "code" takes priority over "complex" for any programming question
+5. "is_multi_part" = true ONLY if message has 2+ clearly distinct, unrelated requests
+6. "has_code_and_explain" = true ONLY when BOTH writing code AND explaining it is requested
+
+Reply with ONLY this JSON — nothing else:
+{"category": "code"|"simple"|"complex"|"rag_search"|"agent_task", "is_multi_part": true|false, "has_code_and_explain": true|false, "reason": "one short sentence", "confidence": 0.0-1.0}
 """
 
+# ── Keyword safety-nets ───────────────────────────────────────────────────────
 _EXPLAIN_KEYWORDS = [
     "explain", "walk me through", "walk through", "how it works",
     "step by step", "step-by-step", "break it down", "describe",
@@ -193,6 +193,35 @@ _CODE_KEYWORDS = [
     "implement", "create", "generate", "debug", "fix", "bug",
     "test", "class", "method", "api", "sql", "query", "python",
     "javascript", "typescript", "java", "c++", "rust", "go",
+    "react", "html", "css", "flask", "fastapi", "django",
+]
+_SIMPLE_KEYWORDS = [
+    "hello", "hi ", "hey ", "thanks", "thank you", "good morning",
+    "good afternoon", "good evening", "bye", "goodbye", "how are you",
+    "what is your name", "who are you", "what time", "what day",
+]
+_FILE_CREATION_KEYWORDS = [
+    "create a pdf", "generate a pdf", "make a pdf", "write a pdf",
+    "create a word", "generate a word", "make a word", "write a word",
+    "create a doc", "generate a doc",
+    "create an excel", "make an excel", "generate an excel",
+    "generate a spreadsheet", "create a spreadsheet", "make a spreadsheet",
+    "create a csv", "make a csv", "generate a csv",
+    "create a report", "generate a report", "save as pdf", "export to pdf",
+    "create a presentation", "make a powerpoint", "generate a pptx",
+    "create a json", "generate a json file", "generate a json",
+    "write a report and save", "create and save", "make and save",
+    "make a file", "generate a file", "export a file",
+]
+_RAG_KEYWORDS = [
+    "what does the document", "what does my document", "what does the file",
+    "from the uploaded", "in my files", "search the knowledge base",
+    "from the knowledge base", "what does the report say", "search my docs",
+    "what does the uploaded document", "what does the uploaded file",
+    "what does it say about", "find in the document", "look up in",
+    "from the uploaded file", "what the document says",
+    "according to the document", "according to the report",
+    "what does my report", "what does my file",
 ]
 
 
@@ -201,45 +230,103 @@ def _looks_like_code_and_explain(query: str) -> bool:
     return any(k in q for k in _CODE_KEYWORDS) and any(k in q for k in _EXPLAIN_KEYWORDS)
 
 
-def classify_question(query: str) -> dict:
-    recent       = HISTORY[-4:]
-    context_text = "\n".join(f"{m['role']}: {m['content']}" for m in recent)
+def _quick_classify(query: str) -> str | None:
+    """
+    Fast keyword-based pre-screening for obvious cases.
+    Returns a category string or None to fall through to LLM classification.
+    """
+    q = query.lower().strip()
+    word_count = len(q.split())
 
+    # Simple: very short greetings / small talk
+    if word_count <= 6 and any(k in q for k in _SIMPLE_KEYWORDS):
+        return "simple"
+
+    # Very short query with no technical terms → probably simple
+    if word_count <= 4 and not any(k in q for k in _CODE_KEYWORDS + _FILE_CREATION_KEYWORDS):
+        return "simple"
+
+    # File creation → agent_task
+    if any(k in q for k in _FILE_CREATION_KEYWORDS):
+        return "agent_task"
+
+    # RAG search → rag_search
+    if any(k in q for k in _RAG_KEYWORDS):
+        return "rag_search"
+
+    return None  # Let the LLM decide
+
+
+def classify_question(query: str) -> dict:
+    """
+    Classify a user query into one of 5 routing categories.
+    Uses fast keyword pre-screening first, then LLM classification,
+    with keyword safety-nets as final fallback.
+    """
+    recent = HISTORY[-4:]
+    context_text = "\n".join(f"{m['role']}: {m['content'][:120]}" for m in recent)
+
+    # ── Phase 1: fast keyword pre-screen ──────────────────────────────────────
+    quick = _quick_classify(query)
+    if quick:
+        result_data = {
+            "category":             quick,
+            "model":                pick_model(quick),
+            "is_multi_part":        False,
+            "has_code_and_explain": _looks_like_code_and_explain(query) if quick == "code" else False,
+            "reason":               f"Fast keyword routing → {quick}",
+            "confidence":           0.95,
+            "routing_method":       "keyword",
+        }
+        _log_event("classify", {"query": query, "result": result_data})
+        return result_data
+
+    # ── Phase 2: LLM classification ───────────────────────────────────────────
     category         = "complex"
     is_multi_part    = False
     has_code_explain = False
     reason           = ""
+    confidence       = 0.5
 
     try:
         response = ollama.chat(
             model=FAST_MODEL,
             messages=[
                 {"role": "system", "content": CLASSIFY_PROMPT},
-                {"role": "user",   "content": f"Recent chat:\n{context_text}\n\nNew question: {query}"},
+                {"role": "user",   "content": f"Recent chat:\n{context_text}\n\nNew message: {query}"},
             ],
             format="json",
             options={"temperature": 0},
         )
         raw = response["message"]["content"] if isinstance(response, dict) else response.message.content
-        result           = json.loads(raw)
-        category         = result.get("category", "complex")
-        is_multi_part    = bool(result.get("is_multi_part", False))
-        has_code_explain = bool(result.get("has_code_and_explain", False))
-        reason           = result.get("reason", "")
+        parsed        = json.loads(raw)
+        category      = parsed.get("category", "complex")
+        is_multi_part = bool(parsed.get("is_multi_part", False))
+        has_code_explain = bool(parsed.get("has_code_and_explain", False))
+        reason        = parsed.get("reason", "")
+        confidence    = float(parsed.get("confidence", 0.7))
 
+        # Safety-net: keyword override for obvious code+explain
         if not has_code_explain and _looks_like_code_and_explain(query):
             has_code_explain = True
 
     except Exception:
-        # Fallback: keyword-based classification
+        # ── Phase 3: keyword fallback ──────────────────────────────────────
         q_lower = query.lower()
-        if any(k in q_lower for k in ["code", "python", "function", "bug", "error", "script", "sql", "debug", "fix", "class"]):
+        if any(k in q_lower for k in _FILE_CREATION_KEYWORDS):
+            category = "agent_task"
+        elif any(k in q_lower for k in _RAG_KEYWORDS):
+            category = "rag_search"
+        elif any(k in q_lower for k in ["code", "python", "function", "bug", "error", "script", "sql", "debug", "fix", "class", "api"]):
             category = "code"
+        elif len(query.split()) <= 8:
+            category = "simple"
         else:
             category = "complex"
         has_code_explain = _looks_like_code_and_explain(query)
         is_multi_part    = has_code_explain or (" and " in q_lower and len(query) > 40)
-        reason           = "fallback keyword match (model reply was not valid JSON)"
+        reason           = "Keyword fallback (LLM classifier unavailable)"
+        confidence       = 0.6
 
     # Validate category
     if category not in AVAILABLE_MODELS:
@@ -251,6 +338,8 @@ def classify_question(query: str) -> dict:
         "is_multi_part":        is_multi_part,
         "has_code_and_explain": has_code_explain,
         "reason":               reason,
+        "confidence":           confidence,
+        "routing_method":       "llm",
     }
     _log_event("classify", {"query": query, "result": result_data})
     return result_data
@@ -304,9 +393,8 @@ def get_full_answer(model: str, query: str) -> str:
     _log_event("model_start", {"model": model, "query": query})
     messages = _build_messages(query)
 
-    # First call — may produce tool_calls
     try:
-        response   = ollama.chat(model=model, messages=messages, tools=TOOL_SCHEMAS)
+        response = ollama.chat(model=model, messages=messages, tools=TOOL_SCHEMAS)
     except Exception as exc:
         _log_event("model_done", {"model": model, "answer": f"[Error] {exc}"})
         err_msg = f"Error calling model '{model}': {exc}"
@@ -339,7 +427,6 @@ def get_full_answer(model: str, query: str) -> str:
             _log_event("tool_call", {"tool": func_name, "args": args, "result": str(result)})
             messages.append({"role": "tool", "content": str(result)})
 
-        # Second call — generate natural language response with tool results in context
         try:
             response = ollama.chat(model=model, messages=messages)
         except Exception as exc:
@@ -350,7 +437,7 @@ def get_full_answer(model: str, query: str) -> str:
 
     answer = _get(response, "message", "content") or ""
 
-    # Fallback: if the model emitted a JSON tool call block in text instead of native tool_calls
+    # Fallback: embedded JSON tool calls in text
     if not tool_calls:
         embedded = _find_embedded_tool_calls(answer)
         for func_name, args in embedded:
@@ -377,7 +464,6 @@ def stream_answer(model: str, query: str):
     response_msg: dict = {"role": "assistant", "content": ""}
     tool_calls:   list = []
 
-    # Stream first response
     try:
         for chunk in ollama.chat(model=model, messages=messages, stream=True, tools=TOOL_SCHEMAS):
             chunk_tcs = _get(chunk, "message", "tool_calls") or []
@@ -398,7 +484,6 @@ def stream_answer(model: str, query: str):
         _log_event("stream_done", {"model": model, "answer": full_answer})
         return
 
-    # If tools were called, execute them and stream the follow-up
     if tool_calls:
         response_msg["tool_calls"] = tool_calls
         messages.append(response_msg)
@@ -426,7 +511,6 @@ def stream_answer(model: str, query: str):
             messages.append({"role": "tool", "content": str(result)})
 
         yield "\n"
-        # Stream follow-up response (no tools= here — just natural language)
         try:
             for chunk in ollama.chat(model=model, messages=messages, stream=True):
                 token = _get(chunk, "message", "content") or ""
@@ -439,7 +523,6 @@ def stream_answer(model: str, query: str):
             full_answer += err
 
     elif not tool_calls:
-        # Fallback: check if the model emitted a JSON tool call block in text instead of native tool_calls
         embedded = _find_embedded_tool_calls(full_answer)
         for func_name, args in embedded:
             if func_name in TOOL_FUNCTIONS:
@@ -516,9 +599,8 @@ def stream_image_answer(image_b64: str, query: str):
 def run_sequential_tasks(query: str) -> list:
     results = []
 
-    # Step 1: Code
     code_prompt = (
-        f"The user asked: \"{query}\"\n\n"
+        f'The user asked: "{query}"\n\n'
         "Your job for this step: write ONLY the code. "
         "Do not explain it yet — just provide clean, well-commented code."
     )
@@ -531,7 +613,6 @@ def run_sequential_tasks(query: str) -> list:
         "answer":     code_answer,
     })
 
-    # Step 2: Explain (MAIN_MODEL sees the code already in shared HISTORY)
     explain_prompt = (
         "Now explain the code you just wrote above, step by step. "
         "Be clear and beginner-friendly. Cover what each part does and why."
@@ -575,7 +656,6 @@ Message: {query}
         raw_content = response["message"]["content"] if isinstance(response, dict) else response.message.content
         raw = json.loads(raw_content)
 
-        # Model may wrap the list in {"tasks": [...]}
         raw_tasks = raw.get("tasks", raw) if isinstance(raw, dict) else raw
 
         if not isinstance(raw_tasks, list):
@@ -603,6 +683,24 @@ Message: {query}
     except Exception:
         pass
 
-    # Fallback: treat as a single task
+    # Small local models occasionally return invalid JSON for an obviously
+    # multi-part request.  Do not silently collapse it into one expensive task.
+    parts = [p.strip(" ,.;") for p in re.split(
+        r"(?:\n+|;|,\s*(?=(?:also\s+)?(?:write|create|generate|make|give|draft|explain)\b)|"
+        r"\s+and\s+(?=(?:also\s+)?(?:write|create|generate|make|give|draft|explain)\b))",
+        query, flags=re.I,
+    ) if p.strip(" ,.;")]
+    if len(parts) >= 2:
+        tasks = []
+        for part in parts:
+            category = _quick_classify(part) or "complex"
+            tasks.append({
+                "label": part[:60],
+                "task": part,
+                "category": category,
+                "model": pick_model(category),
+            })
+        return tasks
+
     info = classify_question(query)
     return [{"label": "Full request", "task": query, "category": info["category"], "model": info["model"]}]

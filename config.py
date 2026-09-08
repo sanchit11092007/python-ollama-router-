@@ -34,14 +34,23 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 RAG_LLM_MODEL          = os.getenv("RAG_LLM_MODEL",          MAIN_MODEL)
 RAG_EMBEDDING_MODEL    = os.getenv("RAG_EMBEDDING_MODEL",    "nomic-embed-text")
 RAG_VISION_MODEL       = os.getenv("RAG_VISION_MODEL",       IMAGE_MODEL)
-RAG_TOP_K              = int(os.getenv("RAG_TOP_K",          "5"))
+RAG_TOP_K              = int(os.getenv("RAG_TOP_K",          "8"))
 RAG_FETCH_K            = int(os.getenv("RAG_FETCH_K",        "20"))
-RAG_MAX_CONTEXT_DOCS   = int(os.getenv("RAG_MAX_CONTEXT_DOCS","6"))
+RAG_MAX_CONTEXT_DOCS   = int(os.getenv("RAG_MAX_CONTEXT_DOCS","8"))
 RAG_CHUNK_SIZE         = int(os.getenv("RAG_CHUNK_SIZE",     "900"))
 RAG_CHUNK_OVERLAP      = int(os.getenv("RAG_CHUNK_OVERLAP",  "150"))
-RAG_ENABLE_MULTI_QUERY       = os.getenv("RAG_ENABLE_MULTI_QUERY",       "false").lower() == "true"
+RAG_ENABLE_MULTI_QUERY       = os.getenv("RAG_ENABLE_MULTI_QUERY",       "true").lower() == "true"
 RAG_ENABLE_SEMANTIC_SPLITTER = os.getenv("RAG_ENABLE_SEMANTIC_SPLITTER", "false").lower() == "true"
-RAG_QUERY_EXPANSION          = os.getenv("RAG_QUERY_EXPANSION",          "false").lower() == "true"
+RAG_QUERY_EXPANSION          = os.getenv("RAG_QUERY_EXPANSION",          "true").lower() == "true"
+
+# ── Output / Files ─────────────────────────────────────────────────────────────
+# All generated files (PDFs, Word docs, etc.) go to ~/Downloads/AgentOTG/
+DOWNLOADS_DIR = Path(os.environ.get("USERPROFILE", Path.home())) / "Downloads" / "AgentOTG"
+
+# ── Smart Routing ──────────────────────────────────────────────────────────────
+# When True, the system auto-detects intent (RAG / agent / image / normal)
+# without requiring the user to type /rag, /agent, /image etc.
+SMART_ROUTING_ENABLED = os.getenv("SMART_ROUTING_ENABLED", "true").lower() == "true"
 
 # ── PostgreSQL ─────────────────────────────────────────────────────────────────
 DB_HOST     = os.getenv("DB_HOST",     "localhost")

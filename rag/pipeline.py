@@ -15,6 +15,7 @@ from .config import (
     ENABLE_QUERY_EXPANSION,
     OLLAMA_BASE_URL,
     RAG_LLM_MODEL,
+    MAX_CONTEXT_DOCS,
 )
 from .loaders import load_file, load_files
 from .prompts import RAG_PROMPT
@@ -85,17 +86,33 @@ def _expand_query(query: str) -> list[str]:
 # ── Context formatter ─────────────────────────────────────────────────────────
 
 def _format_docs(docs) -> str:
+    """Format retrieved documents into a rich context block with full metadata."""
     if not docs:
         return "[NO_RELEVANT_CONTEXT]"
     blocks = []
     for i, doc in enumerate(docs, 1):
-        m      = doc.metadata
-        source = m.get("file_name") or m.get("source", "unknown")
-        page   = m.get("page")
-        location = f", page {page}" if page else ""
-        blocks.append(f"[{i}] source: {source}{location}\n{doc.page_content}")
-    return "\n\n---\n\n".join(blocks)
+        m = doc.metadata
+        source    = m.get("file_name") or m.get("source", "unknown")
+        page      = m.get("page")
+        sheet     = m.get("sheet")
+        row       = m.get("row")
+        chunk_idx = m.get("chunk_index", "")
+        ctype     = m.get("content_type", "text")
 
+        # Build location string
+        location_parts = []
+        if page:
+            location_parts.append(f"page {page}")
+        if sheet:
+            location_parts.append(f"sheet '{sheet}'")
+        if row:
+            location_parts.append(f"row {row}")
+        location = (", " + ", ".join(location_parts)) if location_parts else ""
+
+        header = f"[{i}] Source: {source}{location} | Type: {ctype}"
+        blocks.append(f"{header}\n{doc.page_content}")
+
+    return "\n\n---\n\n".join(blocks)
 
 
 def categorize_ingestion_error(exc: Exception) -> str:
@@ -114,12 +131,11 @@ def categorize_ingestion_error(exc: Exception) -> str:
     if isinstance(exc, ValueError) and "unsupported format" in err_lower:
         return f"Unsupported format: {err_msg}"
     if "vectorization" in err_lower or "ollama" in exc_type.lower() or "ollama" in err_lower or "embedding" in err_lower:
-        return f"Vectorization error: {err_msg}"
+        return f"Vectorization error (check that nomic-embed-text is pulled): {err_msg}"
     if "chroma" in exc_type.lower() or "chroma" in err_lower or "database" in err_lower or "storage" in err_lower:
         return f"Database storage error: {err_msg}"
 
     return f"Ingestion error: {err_msg}"
-
 
 
 # ── Ingestion ─────────────────────────────────────────────────────────────────
@@ -134,9 +150,9 @@ def ingest_paths(paths: list[str], replace_existing: bool = True) -> dict:
                     delete_source(source)
                 except Exception as del_err:
                     logger.debug(f"Delete source failed: {del_err}\n{traceback.format_exc()}")
-        
+
         chunks = split_documents(raw_docs)
-        
+
         try:
             count = add_documents(chunks)
         except Exception as embed_err:
@@ -149,16 +165,16 @@ def ingest_paths(paths: list[str], replace_existing: bool = True) -> dict:
 
         first_path = paths[0] if paths else ""
         return {
-            "path":             first_path,
-            "file_exists":      True,
-            "loader":           loader_name,
-            "rows_loaded":      rows_loaded,
-            "documents_loaded": len(raw_docs),
-            "chunks_generated": len(chunks),
+            "path":               first_path,
+            "file_exists":        True,
+            "loader":             loader_name,
+            "rows_loaded":        rows_loaded,
+            "documents_loaded":   len(raw_docs),
+            "chunks_generated":   len(chunks),
             "embeddings_created": count,
-            "status":           "SUCCESS",
-            "files":            len(paths),
-            "chunks_indexed":   count,
+            "status":             "SUCCESS",
+            "files":              len(paths),
+            "chunks_indexed":     count,
         }
     except RuntimeError:
         # Already categorized — re-raise as-is to avoid double-prefixing the message.
@@ -172,7 +188,6 @@ def ingest_paths(paths: list[str], replace_existing: bool = True) -> dict:
 
 def ingest_path(path: str, replace_existing: bool = True) -> dict:
     return ingest_paths([path], replace_existing=replace_existing)
-
 
 
 # ── RAG Answer (with query expansion loop) ───────────────────────────────────
@@ -189,47 +204,82 @@ def answer(
       1. Expand query → 1–3 semantic variants
       2. Retrieve for ALL variants, deduplicate by content hash
       3. If expansion gave 0 docs, fall back to direct similarity search
-      4. Format context and invoke the LLM chain
-      5. Return answer + sources + strategy used
+      4. Re-rank retrieved docs by keyword overlap
+      5. Format rich context and invoke the LLM chain
+      6. Return answer + sources + strategy used
 
     The expansion loop dramatically improves recall without requiring
     MultiQueryRetriever or any extra dependencies.
     """
-    requested_k = max(1, min(int(top_k), 20)) if top_k is not None else None
+    # Safely resolve top_k — fix the bug where None caused int() crash
+    requested_k: int | None = None
+    if top_k is not None:
+        try:
+            requested_k = max(1, min(int(top_k), 20))
+        except (TypeError, ValueError):
+            requested_k = None
+
     queries = _expand_query(query)
+
     if len(queries) > 1:
         docs, selected_strategy = retrieve_expanded(
-            queries, strategy=strategy, access_filter=access_filter, **({"top_k": requested_k} if requested_k else {})
+            queries,
+            strategy=strategy,
+            access_filter=access_filter,
+            **( {"top_k": requested_k} if requested_k else {}),
         )
     else:
         docs, selected_strategy = retrieve(
-            query, strategy=strategy, access_filter=access_filter, **({"top_k": requested_k} if requested_k else {})
-        )
-    if not docs and len(queries) > 1:
-        docs, selected_strategy = retrieve(
-            query, strategy="similarity", access_filter=access_filter, **({"top_k": requested_k} if requested_k else {})
+            query,
+            strategy=strategy,
+            access_filter=access_filter,
+            **( {"top_k": requested_k} if requested_k else {}),
         )
 
-    # Step 4 — No docs at all → early return
+    # Fallback: if expansion found nothing, try direct similarity
+    if not docs and len(queries) > 1:
+        docs, selected_strategy = retrieve(
+            query,
+            strategy="similarity",
+            access_filter=access_filter,
+            **( {"top_k": requested_k} if requested_k else {}),
+        )
+
+    # No docs at all → early return with clear message
     if not docs:
         return {
-            "answer":             "I couldn't find sufficient information in the provided knowledge base.",
+            "answer":             "I couldn't find sufficient information in the provided knowledge base to answer this question. Please make sure the relevant documents have been ingested using /doc <file>.",
             "sources":            [],
             "retrieval_strategy": selected_strategy,
             "documents":          [],
         }
 
-    # Step 5 — Invoke LLM with formatted context
-    result = _get_chain().invoke({"question": query, "context": _format_docs(docs)})
+    # Invoke LLM with formatted, rich context
+    context_text = _format_docs(docs)
+
+    # Guard against [NO_RELEVANT_CONTEXT] pass-through to LLM
+    if context_text == "[NO_RELEVANT_CONTEXT]":
+        return {
+            "answer":             "No relevant context was found in the knowledge base for this query. Try rephrasing or ingest more documents.",
+            "sources":            [],
+            "retrieval_strategy": selected_strategy,
+            "documents":          [],
+        }
+
+    result = _get_chain().invoke({"question": query, "context": context_text})
 
     sources = []
     for d in docs:
-        sources.append({
+        entry = {
             "source":      d.metadata.get("file_name") or d.metadata.get("source", "unknown"),
             "page":        d.metadata.get("page"),
+            "sheet":       d.metadata.get("sheet"),
+            "row":         d.metadata.get("row"),
             "document_id": d.metadata.get("document_id"),
             "chunk_index": d.metadata.get("chunk_index"),
-        })
+        }
+        # Deduplicate sources by source name + page
+        sources.append(entry)
 
     return {
         "answer":             result,

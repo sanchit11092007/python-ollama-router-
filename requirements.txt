@@ -36,3 +36,9 @@ Pillow
 
 # ── Optional: semantic splitting (only needed if RAG_ENABLE_SEMANTIC_SPLITTER=true)
 # langchain-experimental
+
+# For local image generation
+diffusers
+torch
+transformers
+accelerate
