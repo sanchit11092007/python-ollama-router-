@@ -11,7 +11,7 @@ except ImportError:
 # All values are configurable through environment variables so the backend can be
 # changed at deployment time without rewriting the RAG code.
 OLLAMA_BASE_URL     = os.getenv("OLLAMA_BASE_URL",     "http://localhost:11434")
-RAG_LLM_MODEL       = os.getenv("RAG_LLM_MODEL",       "qwen2.5:14b")
+RAG_LLM_MODEL       = os.getenv("RAG_LLM_MODEL",       "qwen2.5:7b")
 RAG_VISION_MODEL    = os.getenv("RAG_VISION_MODEL",    "qwen2.5vl:7b")
 RAG_EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "nomic-embed-text")
 

@@ -12,7 +12,6 @@ py -m pip install -r requirements-dev.txt
 
 ```powershell
 ollama pull qwen2.5:7b
-ollama pull qwen2.5:14b
 ollama pull qwen2.5-coder:latest
 ollama pull qwen2.5vl:7b
 ollama pull nomic-embed-text

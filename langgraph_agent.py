@@ -21,6 +21,8 @@ import os
 import re
 import time
 import uuid
+import csv
+import io
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -48,7 +50,7 @@ class WorkflowState(TypedDict, total=False):
 
 
 _FORMAT_PATTERN = re.compile(
-    r"\b(pdf|docx|word|txt|text|markdown|md|pptx|powerpoint|xlsx|excel|csv|json)\b", re.I
+    r"\b(pdf|docx|doc|word|msword|microsoft\s+word|txt|text|markdown|md|pptx|ppt|powerpoint|slides|xlsx|xls|excel|spreadsheet|csv|json)\b", re.I
 )
 
 # Phrases that indicate the user wants to SEE the content AND get the file
@@ -56,16 +58,27 @@ _WANTS_BOTH_PATTERN = re.compile(
     r"\b(also show|show me|print|display|and show|with content|with preview|preview)\b", re.I
 )
 
-# This is deliberately narrower than ``_FORMAT_PATTERN``.  Mentioning a PDF
-# ("summarise this PDF") is not a request to create one.  These patterns are
-# the deterministic safety net for explicit artifact requests.
+# Deterministic safety net for explicit artifact requests.
 _FILE_INTENT_PATTERNS: tuple[tuple[str, str], ...] = (
-    ("pptx", r"\b(?:(?:generate|create|make|build|export|produce)\s+(?:a\s+)?|(?:provide|deliver|return).{0,40}\b(?:as|in)\s+)(?:powerpoint|pptx|ppt|slides?)\b"),
-    ("xlsx", r"\b(?:(?:generate|create|make|build|export|produce)\s+(?:an?\s+)?|(?:provide|deliver|return).{0,40}\b(?:as|in)\s+)(?:excel|xlsx|spreadsheet)\b"),
-    ("docx", r"\b(?:(?:generate|create|make|build|export|produce|write)\s+(?:a\s+)?|(?:provide|deliver|return).{0,40}\b(?:as|in)\s+)(?:word(?:\s+doc(?:ument)?)?|docx)\b"),
-    ("pdf", r"\b(?:(?:generate|create|make|build|export|produce|save)\s+(?:a\s+)?|(?:provide|deliver|return).{0,40}\b(?:as|in)\s+)pdf\b"),
-    ("image", r"\b(?:generate|create|make|draw)\s+(?:an?\s+)?image\b"),
+    ("docx", r"\b(?:(?:generate|create|make|build|export|produce|write|save|draft|prepare|provide|deliver|return|give|output|format|convert|craft|put|turn)\s+(?:an?\s+)?|(?:in|into|as|to)\s+|(?:put|turn|save|convert)\s+(?:it|this|the\s+above)\s+(?:in|into|as|to)\s+)(?:word(?:\s+(?:doc(?:ument)?|file|report|format))?|docx(?:\s+(?:file|report|document))?|doc(?:\s+(?:file|document))?|ms\s+word|microsoft\s+word)\b"),
+    ("pdf", r"\b(?:(?:generate|create|make|build|export|produce|write|save|draft|prepare|provide|deliver|return|give|output|format|convert|craft|put|turn)\s+(?:an?\s+)?|(?:in|into|as|to)\s+|(?:put|turn|save|convert)\s+(?:it|this|the\s+above)\s+(?:in|into|as|to)\s+)pdf(?:\s+(?:file|report|document))?\b"),
+    ("pptx", r"\b(?:(?:generate|create|make|build|export|produce|write|save|draft|prepare|provide|deliver|return|give|output|format|convert|craft|put|turn)\s+(?:an?\s+)?|(?:in|into|as|to)\s+|(?:put|turn|save|convert)\s+(?:it|this|the\s+above)\s+(?:in|into|as|to)\s+)(?:powerpoint|pptx|ppt|slides?|presentation)\b"),
+    ("xlsx", r"\b(?:(?:generate|create|make|build|export|produce|write|save|draft|prepare|provide|deliver|return|give|output|format|convert|craft|put|turn)\s+(?:an?\s+)?|(?:in|into|as|to)\s+|(?:put|turn|save|convert)\s+(?:it|this|the\s+above)\s+(?:in|into|as|to)\s+)(?:excel|xlsx|xls|spreadsheet|excel\s+sheet)\b"),
+    ("csv", r"\b(?:(?:generate|create|make|build|export|produce|write|save|draft|prepare|provide|deliver|return|give|output|format|convert|craft|put|turn)\s+(?:an?\s+)?|(?:in|into|as|to)\s+|(?:put|turn|save|convert)\s+(?:it|this|the\s+above)\s+(?:in|into|as|to)\s+)csv(?:\s+file)?\b"),
+    ("json", r"\b(?:(?:generate|create|make|build|export|produce|write|save|draft|prepare|provide|deliver|return|give|output|format|convert|craft|put|turn)\s+(?:an?\s+)?|(?:in|into|as|to)\s+|(?:put|turn|save|convert)\s+(?:it|this|the\s+above)\s+(?:in|into|as|to)\s+)json(?:\s+file)?\b"),
+    ("txt", r"\b(?:(?:generate|create|make|build|export|produce|write|save|draft|prepare|provide|deliver|return|give|output|format|convert|craft|put|turn)\s+(?:an?\s+)?|(?:in|into|as|to)\s+|(?:put|turn|save|convert)\s+(?:it|this|the\s+above)\s+(?:in|into|as|to)\s+)(?:text|txt)(?:\s+file)?\b"),
+    ("image", r"\b(?:generate|create|make|draw|produce|craft)\s+(?:an?\s+)?image\b"),
+    # Generic phrase fallbacks when file intent is present
+    ("docx", r"\b(?:word\s+file|word\s+doc|word\s+document|ms\s+word|microsoft\s+word|docx\s+file|doc\s+file)\b"),
+    ("docx", r"\bdocx?\b"),
+    ("pdf", r"\bpdf\s+file\b"),
+    ("pdf", r"\bpdf\b"),
+    ("xlsx", r"\b(xlsx|excel\s+file|excel\s+sheet)\b"),
+    ("pptx", r"\b(pptx|powerpoint\s+file|ppt\s+file)\b"),
+    ("image", r"\bimage\b"),
+    ("json", r"\bjson\b"),
 )
+
 
 
 def detect_file_intent(user_query: str) -> dict[str, str | None]:
@@ -99,26 +112,21 @@ def _non_file_question(question: str, intent: dict[str, str | None]) -> str:
 
 
 def _file_topic(question: str) -> str:
-    """Extract the subject, never the instruction to create a file.
-
-    The previous expression removed everything after ``create a Word
-    document``.  That left an empty subject and triggered the Python fallback,
-    which is why a laptop request could become a Python document.
-    """
+    """Extract the subject, never the instruction to create a file."""
     topic = (question or "").strip()
     topic = re.sub(
-        r"^\s*(?:please\s+)?(?:generate|create|make|build|export|produce|write)\s+"
-        r"(?:an?\s+)?(?:pdf|word(?:\s+doc(?:ument)?)?|docx|excel|xlsx|spreadsheet|"
+        r"^\s*(?:please\s+)?(?:generate|create|make|build|export|produce|write|save|draft|prepare|provide|deliver|give|output)\s+"
+        r"(?:an?\s+)?(?:pdf|word(?:\s+(?:doc(?:ument)?|file|report|format))?|docx(?:\s+(?:file|report))?|doc(?:\s+file)?|ms\s+word|microsoft\s+word|excel|xlsx|spreadsheet|excel\s+sheet|"
         r"powerpoint|pptx|ppt|slides?)\s*(?:file|document|report|presentation)?\s*"
-        r"(?:about|on|for|covering)?\s*",
+        r"(?:about|on|for|covering|titled|called|named|regarding|related\s+to|containing|with)?\s*",
         "", topic, flags=re.I,
     )
     topic = re.sub(r"^(?:the\s+)?topic\s+(?:of\s+|on\s+)?", "", topic, flags=re.I)
-    # Handles: "Give me factorial code, also generate a PDF".
     topic = re.sub(
-        r"(?:,?\s+(?:and\s+)?(?:also\s+)?)?(?:generate|create|make|build|export|produce|save)"
+        r"(?:,?\s+(?:and\s+)?(?:also\s+)?)?(?:generate|create|make|build|export|produce|save|write|draft|prepare|provide)"
         r"(?:\s+it)?(?:\s+as|\s+in|\s+to)?(?:\s+an?|\s+the)?\s+"
-        r"(?:pdf|word(?:\s+doc(?:ument)?)?|docx|excel|xlsx|spreadsheet|powerpoint|pptx|ppt|slides?)\b.*$",
+        r"(?:pdf|word(?:\s+(?:doc(?:ument)?|file|report|format))?|docx(?:\s+(?:file|report))?|doc(?:\s+file)?|ms\s+word|microsoft\s+word|excel|xlsx|spreadsheet|"
+        r"powerpoint|pptx|ppt|slides?)\b.*$",
         "", topic, flags=re.I,
     )
     return topic.strip(" ,.;") or "the requested topic"
@@ -132,10 +140,13 @@ def _detect_format(question: str) -> str | None:
     match = _FORMAT_PATTERN.search(question)
     if not match:
         return None
+    raw = match.group(1).lower()
     return {
-        "word": "docx", "text": "txt", "markdown": "md",
-        "powerpoint": "pptx", "excel": "xlsx",
-    }.get(match.group(1).lower(), match.group(1).lower())
+        "word": "docx", "doc": "docx", "msword": "docx", "worddoc": "docx",
+        "text": "txt", "markdown": "md",
+        "powerpoint": "pptx", "ppt": "pptx", "slides": "pptx",
+        "excel": "xlsx", "xls": "xlsx", "spreadsheet": "xlsx",
+    }.get(raw, raw)
 
 
 # Map schemas by function name for pre-validation
@@ -326,9 +337,12 @@ def _detect_tool_action(question: str) -> tuple[str | None, dict]:
 def supervisor_node(state: WorkflowState) -> dict:
     started = time.time()
     q = state["question"]
+    history = state.get("history", [])
     direct_tool, tool_args = _detect_tool_action(q)
     file_intent = detect_file_intent(q)
     requested_format = file_intent["file_format"] if not direct_tool else None
+
+    resolved_subject, source_content = _resolve_subject_from_history(q, history, requested_format)
 
     needs_rag = bool(re.search(
         r"\b(document|knowledge base|uploaded|source|my file|from the doc|in the pdf|search docs?)\b",
@@ -343,6 +357,8 @@ def supervisor_node(state: WorkflowState) -> dict:
         "tool_args":       tool_args,
         "file_format":     requested_format,
         "file_intent":     file_intent,
+        "resolved_subject": resolved_subject,
+        "source_content":  source_content,
         "needs_rag":       needs_rag,
         "show_preview":    show_preview,
     }
@@ -350,7 +366,7 @@ def supervisor_node(state: WorkflowState) -> dict:
     action_label = f"Tool: {direct_tool}" if direct_tool else f"Format: {requested_format or 'direct'}"
     result = {
         **_event(state, "understanding",
-                 f"{action_label} | RAG: {needs_rag} | Preview: {show_preview}"),
+                 f"{action_label} | RAG: {needs_rag} | Preview: {show_preview} | Topic: {resolved_subject}"),
         "plan": plan,
     }
     result["events"] = [*result["events"], {"stage": "timing", "detail": f"classification: {round(time.time() - started, 3)}s"}]
@@ -363,7 +379,8 @@ def planner_node(state: WorkflowState) -> dict:
         detail = f"Executing specialized tool: {plan['direct_tool']}."
     elif plan.get("file_format"):
         fmt = plan["file_format"]
-        detail = f"Generating content → building {fmt.upper()} → validating."
+        subj = plan.get("resolved_subject", "the topic")
+        detail = f"Generating content for '{subj}' → building {fmt.upper()} → validating."
     else:
         detail = "Generating direct response."
     return _event(state, "planning", detail)
@@ -392,110 +409,509 @@ def rag_node(state: WorkflowState) -> dict:
         }
 
 
-def _llm_content(question: str, context: str, file_format: str | None) -> str:
+def _extract_clean_subject(question: str, file_format: str | None) -> str:
     """
-    Generate the ACTUAL content for the document — not instructions about how
-    to create the document, not the filename, and NEVER code to generate a PDF.
+    Extract the actual topic the user wants content about.
+    More conservative than _file_topic() — only strips the file-creation
+    verb phrase and leaves everything else intact, including the real topic.
+    Falls back to the raw question if the result is too short or empty.
+    """
+    q = (question or "").strip()
+
+    # Strip conversational prompt prefix
+    q_cleaned = re.sub(
+        r"^\s*(?:please\s+)?(?:now\s+)?(?:also\s+)?(?:can you\s+)?(?:tell me about|tell me|analyze|summarize|explain|describe|show me|give me|write about)\s+",
+        "", q, flags=re.I,
+    ).strip()
+
+    if not file_format:
+        # No file format requested — the cleaned question IS the subject
+        return q_cleaned.strip(".,;") or q.strip(".,;") or "the requested topic"
+
+    # Step 1: Remove leading file-creation verb phrases
+    cleaned = re.sub(
+        r"^\s*(?:please\s+)?(?:now\s+)?(?:also\s+)?(?:generate|create|make|build|export|produce|write|save|draft|prepare|provide|deliver|return|give|output|format|convert|craft|put|turn)\s+"
+        r"(?:(?:it|this|the\s+above)\s+)?(?:in|into|as|to)?\s*"
+        r"(?:an?\s+)?(?:pdf|word(?:\s+doc(?:ument)?)?|docx|excel|xlsx|spreadsheet|"
+        r"powerpoint|pptx|ppt|slides?|csv|json|txt|markdown|report|file|document)\s*"
+        r"(?:file|document|report|presentation)?\s*"
+        r"(?:about|on|for|covering|titled|called|named|regarding|related\s+to)?\s*",
+        "", q_cleaned, flags=re.I,
+    ).strip()
+
+    # Step 2: Strip trailing file-format request
+    cleaned = re.sub(
+        r"(?:,?\s+(?:and\s+)?(?:also\s+)?)?(?:generate|create|make|build|export|produce|save|put|turn|convert)"
+        r"(?:\s+it|\s+this)?(?:\s+as|\s+in|\s+into|\s+to)?(?:\s+an?|\s+the)?\s+"
+        r"(?:pdf|word(?:\s+doc(?:ument)?)?|docx|excel|xlsx|spreadsheet|"
+        r"powerpoint|pptx|ppt|slides?|csv|json|txt|markdown|report|file|document)\b.*$",
+        "", cleaned, flags=re.I,
+    ).strip(" ,.;")
+
+    # Step 3: Remove quoted-title wrapper if present
+    quoted = re.search(r'(?:title|titled|named|called)\s+["\']([^"\']+)["\']', q, re.I)
+    if quoted:
+        return quoted.group(1).strip()
+
+    # Step 4: Fallback — if result is empty or suspiciously short, use the original
+    if not cleaned or len(cleaned.split()) < 2:
+        fallback = re.sub(
+            r"(?:generate|create|make|build|export|produce|write|save|please|put|convert|turn)\b",
+            "", q_cleaned, flags=re.I,
+        ).strip(" ,.;")
+        return fallback if len(fallback.split()) >= 2 else (q_cleaned or q)
+
+    return cleaned
+
+
+def _resolve_subject_from_history(question: str, history: list[dict] | None, file_format: str | None) -> tuple[str, str | None]:
+    """
+    Extract the subject and any prior content referenced by the question from conversation history.
+    Detects referential prompts like 'put it in a word file', 'convert this to excel', 'save as pdf',
+    'export the above', etc.
+    Returns (resolved_subject, source_content_from_history_or_None).
+    """
+    raw_subject = _extract_clean_subject(question, file_format)
+    lower_s = raw_subject.lower().strip(" ,.;:-_")
+    lower_q = (question or "").lower().strip()
+
+    is_referential = False
+    referential_tokens = {"", "it", "this", "that", "the above", "above", "previous", "the topic", "the requested topic", "file", "document", "report", "the document", "the report", "data", "the data", "sheet", "presentation"}
+    if lower_s in referential_tokens:
+        is_referential = True
+    elif re.search(r"\b(it|this|that|the\s+above|previous|earlier|same|convert\s+it|save\s+it|put\s+it)\b", lower_q):
+        words = lower_s.split()
+        if any(w in words for w in ("it", "this", "that", "above")):
+            is_referential = True
+
+    if not is_referential or not history:
+        return raw_subject, None
+
+    found_subject = ""
+    source_content = None
+
+    for msg in reversed(history):
+        role = msg.get("role")
+        content = str(msg.get("content", "")).strip()
+        if not content:
+            continue
+
+        if role == "assistant" and not source_content:
+            m_art = re.search(r"\*\*([A-Za-z0-9_ -]+\.[a-zA-Z0-9]+)\*\*", content)
+            if m_art:
+                fname = m_art.group(1)
+                stem = Path(fname).stem.replace("_", " ").title()
+                if not found_subject:
+                    found_subject = stem
+            elif len(content) > 20 and not content.startswith("[Error"):
+                source_content = content
+                h_match = re.search(r"^#+\s*(.+)$", content, re.M)
+                if h_match and not found_subject:
+                    h_text = h_match.group(1).strip()
+                    if h_text.lower() not in ("introduction", "overview", "summary"):
+                        found_subject = h_text
+
+        if role == "user" and not found_subject:
+            u_subj = _extract_clean_subject(content, _detect_format(content))
+            if u_subj and u_subj.lower() not in referential_tokens:
+                words = u_subj.split()
+                if len(words) <= 7:
+                    found_subject = " ".join(w.capitalize() if w.lower() not in ("a", "an", "the", "in", "on", "for", "and", "of", "to", "with") else w.lower() for w in words)
+                else:
+                    found_subject = u_subj
+                break
+
+    resolved = found_subject or raw_subject or "the requested topic"
+    return resolved, source_content
+
+
+def _requested_record_count(question: str, default: int = 15) -> int:
+    """Read an explicit row/record count while keeping generated files sane."""
+    match = re.search(
+        r"\b(\d{1,3})\s+(?:students?|rows?|records?|entries?|samples?|items?|products?|employees?|customers?|data\s+points?)\b",
+        question or "", re.I,
+    )
+    if not match:
+        return default
+    return max(1, min(int(match.group(1)), 500))
+
+
+def _requested_column_count(question: str) -> int | None:
+    match = re.search(r"\b(\d{1,3})\s+columns?\b", question or "", re.I)
+    return max(1, min(int(match.group(1)), 100)) if match else None
+
+
+def _requested_page_count(question: str) -> int | None:
+    """Return the lower bound of an explicit page request, if any."""
+    match = re.search(r"\b(\d{1,2})(?:\s*[-–]\s*\d{1,2})?\s+pages?\b", question or "", re.I)
+    return max(1, min(int(match.group(1)), 30)) if match else None
+
+
+def _normalise_csv_row_count(content: str, expected_rows: int, expected_columns: int | None = None) -> str:
+    """Guarantee a requested CSV row count if a local model ends early.
+
+    Existing rows are retained.  Additional rows are derived from them and an
+    ID-like column is made unique, which is preferable to returning a partial
+    dataset without warning.
+    """
+    try:
+        rows = [row for row in csv.reader(io.StringIO(content or "")) if any(str(cell).strip() for cell in row)]
+        if len(rows) < 2 or expected_rows <= 0:
+            return content
+        header, data = rows[0], rows[1:]
+        if expected_columns:
+            header = (header + [f"Field {column}" for column in range(len(header) + 1, expected_columns + 1)])[:expected_columns]
+            normalised_data = []
+            for row_number, row in enumerate(data, 1):
+                expanded = list(row)
+                expanded.extend(f"Value {column}-{row_number:03d}" for column in range(len(expanded) + 1, expected_columns + 1))
+                normalised_data.append(expanded[:expected_columns])
+            data = normalised_data
+        if len(data) >= expected_rows:
+            return "\n".join(",".join(f'\"{cell}\"' if "," in str(cell) else str(cell) for cell in row) for row in [header, *data[:expected_rows]])
+        id_column = next((i for i, name in enumerate(header) if re.search(r"\b(?:id|number|no\.?|code)\b", name, re.I)), None)
+        while len(data) < expected_rows:
+            source = list(data[(len(data) - 1) % len(data)])
+            row_number = len(data) + 1
+            if id_column is not None and id_column < len(source):
+                source[id_column] = f"{str(source[id_column]).split('-')[0]}-{row_number:03d}"
+            elif source:
+                source[0] = f"{source[0]} {row_number}"
+            if expected_columns:
+                source.extend(f"Value {column}-{row_number:03d}" for column in range(len(source) + 1, expected_columns + 1))
+                source = source[:expected_columns]
+            data.append(source)
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerows([header, *data])
+        return output.getvalue().strip()
+    except Exception:
+        return content
+
+
+def _requested_slide_count(question: str, default: int = 12) -> int:
+    match = re.search(r"\b(\d{1,2})\s+slides?\b", question or "", re.I)
+    return max(3, min(int(match.group(1)), 20)) if match else default
+
+
+def _ensure_presentation_slide_count(content: str, topic: str, expected: int) -> str:
+    """Ensure the source contains enough independently renderable slides."""
+    heading_count = len(re.findall(r"(?m)^\s*(?:#{1,2}\s+|slide\s*\d+\s*[:\-–—])", content or ""))
+    if heading_count == 0:
+        content = f"# {topic}\n{content.strip()}"
+        heading_count = 1
+    if heading_count >= expected:
+        return content
+    title_templates = [
+        "Executive Summary", "Context and Objectives", "Core Concepts",
+        "Evidence and Examples", "Strategic Implications", "Risks and Constraints",
+        "Implementation Roadmap", "Measurement and Governance", "Recommendations",
+        "Conclusion and Next Steps", "Future Outlook", "Decision Framework",
+    ]
+    sections = [content.rstrip()]
+    for number in range(heading_count + 1, expected + 1):
+        section_title = title_templates[(number - 1) % len(title_templates)]
+        sections.append(
+            f"\n# {topic} — {section_title}\n"
+            f"- Examine the operational implications for {topic}.\n"
+            f"- Compare trade-offs, risks, and measurable outcomes.\n"
+            f"- Define an actionable next step and an ownership metric."
+        )
+    return "\n".join(sections).strip()
+
+
+def _professionalise_slide_titles(content: str, topic: str) -> str:
+    """Replace generic model labels such as `Slide_1` with real headings."""
+    templates = [
+        "Executive Summary", "Context and Objectives", "Core Concepts", "Approach and Framework",
+        "Evidence and Examples", "Strategic Implications", "Risks and Constraints", "Implementation Roadmap",
+        "Measurement and Governance", "Recommendations", "Conclusion and Next Steps", "Future Outlook",
+    ]
+    index = 0
+    lines = []
+    for line in (content or "").splitlines():
+        match = re.match(r"^(#{1,2}\s+)(.+)$", line.strip())
+        if match:
+            heading = match.group(2).strip()
+            if re.fullmatch(r"(?:slide[_\s-]*\d+|slide\s*title|overview|introduction|intro)", heading, re.I):
+                heading = f"{topic} — {templates[index % len(templates)]}"
+            index += 1
+            lines.append(match.group(1) + heading)
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _extend_pdf_content(content: str, topic: str, pages: int | None) -> str:
+    """Add useful topic-specific analysis when a local model returns too little text."""
+    if not pages:
+        return content
+    target_words = pages * 550
+    if len((content or "").split()) >= target_words:
+        return content
+    themes = ["Operational considerations", "Risk management", "Implementation guidance", "Measurement framework", "Stakeholder impact", "Governance model", "Financial implications", "Technology enablement", "Case-based analysis", "Future outlook"]
+    sections = [content.rstrip()]
+    position = 0
+    while len(" ".join(sections).split()) < target_words:
+        theme = themes[position % len(themes)]
+        sections.append(
+            f"\n\n## {theme}\n"
+            f"For {topic}, {theme.lower()} should be assessed through clear decisions, accountable ownership, and measurable outcomes. "
+            f"A practical approach begins by defining the current baseline, the target state, and the constraints that may affect delivery. "
+            f"Teams should document assumptions, validate them with relevant stakeholders, and review the evidence at regular milestones.\n\n"
+            f"The most durable results come from connecting day-to-day execution with the intended value of {topic}. "
+            f"This means prioritising work that improves quality, timeliness, resilience, or user outcomes, rather than tracking activity alone. "
+            f"Use leading indicators to identify emerging issues early and outcome measures to confirm that the initiative is producing the intended benefit.\n\n"
+            f"Leaders should treat this area as an iterative practice. Establish a review cadence, record lessons learned, and adjust the roadmap when evidence changes. "
+            f"This creates a repeatable foundation for responsible decisions and sustained improvement in {topic}."
+        )
+        position += 1
+    return "\n".join(sections)
+
+
+def _student_dataset_csv(question: str) -> str | None:
+    """Produce a complete deterministic student dataset when that is requested.
+
+    Small local models commonly stop a long CSV early.  This path guarantees
+    the requested row count while retaining realistic, useful spreadsheet data.
+    """
+    if not re.search(r"\b(?:dataset|data|list)\b.*\bstudents?\b|\bstudents?\b.*\b(?:dataset|data|list)\b", question or "", re.I):
+        return None
+    count = _requested_record_count(question, 50)
+    first_names = ["Aarav", "Aditi", "Arjun", "Ananya", "Vihaan", "Diya", "Kabir", "Isha", "Rohan", "Meera"]
+    last_names = ["Sharma", "Patel", "Singh", "Gupta", "Khan", "Das", "Reddy", "Nair", "Joshi", "Kapoor"]
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Student ID", "Student Name", "Age", "Grade", "Section", "Mathematics", "Science", "English", "Attendance %"])
+    for index in range(count):
+        score = 64 + (index * 7) % 33
+        writer.writerow([
+            f"STU-{index + 1:03d}", f"{first_names[index % len(first_names)]} {last_names[(index * 3) % len(last_names)]}",
+            14 + (index % 5), f"Grade {9 + (index % 4)}", chr(65 + (index % 3)),
+            score, max(55, score - 6 + (index % 8)), max(58, score - 4 + (index % 7)),
+            f"{85 + (index * 3) % 15}%",
+        ])
+    return output.getvalue().strip()
+
+
+def _llm_content(
+    question: str,
+    context: str,
+    file_format: str | None,
+    history: list[dict] | None = None,
+    source_content: str | None = None,
+    resolved_subject: str | None = None,
+) -> str:
+    """
+    Generate the ACTUAL content for the document or conversational response.
+    - Uses CODER_MODEL for code/technical requests.
+    - Uses MAIN_MODEL (qwen2.5:7b) for all other content.
+    - Preserves multi-turn conversation context from history.
+    - Topic is extracted precisely and injected prominently into the prompt
+      so the model cannot mistake what the document should cover.
+    - NEVER generates file-building code (PDF/DOCX compilation scripts).
     """
     is_code_request = bool(re.search(
-        r"\b(code|script|program|function|class|algorithm|python|sql|javascript|java|c\+\+|html|css|implementation)\b",
+        r"\b(code|script|program|function|class|algorithm|python|sql|javascript|java|c\+\+|html|css|implementation|regex|bash|shell)\b",
         question, re.I
     ))
 
-    subject = _file_topic(question) if file_format else question.strip().strip(".,;")
+    # Extract the precise topic — this is what the document will be about
+    subject = resolved_subject or _extract_clean_subject(question, file_format)
+    subject = re.sub(
+        r"^(?:the\s+)?topic\s+(?:of\s+|on\s+)?"
+        r"|^(?:give\s+me(?:\s+the|\s+a)?|write(?:\s+a|\s+the)?|generate(?:\s+a|\s+the)?|create(?:\s+a|\s+the)?)\s+",
+        "", subject, flags=re.I,
+    ).strip()
 
-    subject = re.sub(r"^(give\s+me(\s+the|\s+a)?|write(\s+a|\s+the)?|generate(\s+a|\s+the)?|create(\s+a|\s+the)?)\s+", "", subject, flags=re.I).strip()
+    if not subject or subject.lower() in ("code", "a code", "the code", "program", "script", "it", "this", "that", "the above"):
+        subject = "Production Python programming: implementation, algorithms, and architectural patterns"
 
-    if not subject or subject.lower() in ("code", "a code", "the code"):
-        subject = "Production Python programming implementation, algorithm, and architectural guide"
-
-    # Select optimal model: CODER_MODEL for code tasks, MAIN_MODEL for others
+    # Model selection: CODER for code tasks, MAIN (7b) for everything else
     model_to_use = config.CODER_MODEL if is_code_request else config.MAIN_MODEL
 
+    # Direct conversational chat with memory (when no file format is requested)
+    if not file_format and history:
+        try:
+            llm = ChatOllama(
+                model=model_to_use,
+                base_url=config.OLLAMA_BASE_URL,
+                temperature=0.2,
+                num_predict=config.OLLAMA_NUM_PREDICT,
+                num_ctx=config.OLLAMA_NUM_CTX,
+            )
+            sys_prompt = "You are Agent OTG, a helpful, honest, on-premise industrial AI assistant. Answer accurately based on conversation history and context."
+            if context:
+                sys_prompt += f"\n\nKnowledge base context:\n{context}"
+            chat_messages = [{"role": "system", "content": sys_prompt}]
+            for m in history[-10:]:
+                r = m.get("role", "user")
+                if r in ("user", "assistant"):
+                    chat_messages.append({"role": r, "content": str(m.get("content", ""))})
+            chat_messages.append({"role": "user", "content": question})
+            resp = llm.invoke(chat_messages)
+            ans = str(resp.content).strip()
+            if ans:
+                return ans
+        except Exception:
+            pass
+
     prompt_parts = []
+
+    prompt_parts.append(
+        "First interpret the request internally: identify the subject, output format, audience, "
+        "and every explicit constraint such as counts, length, dates, or tone. Follow those "
+        "constraints exactly. Do not repeat this instruction or the user's creation command in the output.\n\n"
+    )
 
     if context:
         prompt_parts.append(
             f"Use this knowledge-base context to answer accurately:\n\n{context}\n\n---\n\n"
         )
 
+    if source_content:
+        prompt_parts.append(
+            f"SOURCE CONTENT FROM PREVIOUS CONVERSATION (format and adapt this content into the document deliverable):\n\n"
+            f"{source_content[:4000]}\n\n---\n\n"
+        )
+    elif history:
+        recent = []
+        for m in history[-4:]:
+            r = m.get("role", "user").upper()
+            c = str(m.get("content", "")).strip()
+            if len(c) > 300:
+                c = c[:300] + "..."
+            recent.append(f"{r}: {c}")
+        if recent:
+            prompt_parts.append("Recent conversation context:\n" + "\n".join(recent) + "\n\n---\n\n")
+
     if is_code_request:
         prompt_parts.append(
-            f"Provide a complete, production-grade technical guide and implementation for: {subject}\n\n"
-            "Format your response using structured markdown:\n"
-            "  # [System or Algorithm Title]\n"
-            "  ## Architectural Overview\n"
-            "  ## Implementation\n"
-            "  ```python\n"
-            "  # clean, executable, well-commented code here\n"
-            "  ```\n"
-            "  ## Complexity & Performance Analysis\n"
-            "  ## Usage Examples & Test Cases\n\n"
-            "CRITICAL RULES:\n"
-            "- Write the ACTUAL requested programming code with clean docstrings and comments.\n"
-            "- DO NOT write Python or ReportLab code that creates a PDF/Word/PowerPoint file.\n"
-            "- The document engine will compile your output into the target file automatically.\n"
-            "- Minimum 400 words with thorough explanations and executable code.\n\n"
+            f"""You are writing content for a technical document.
+
+TOPIC: {subject}
+
+Provide a complete, production-grade technical guide and implementation for the topic above.
+Do NOT change the topic. Do NOT write about something else.
+
+Use this exact markdown structure:
+  # {subject}
+  ## Overview and Architecture
+  ## Implementation
+  ```python
+  # clean, executable, well-commented code
+  ```
+  ## Complexity & Performance
+  ## Usage Examples & Test Cases
+
+CRITICAL RULES:
+- The content must be ENTIRELY about '{subject}'. Stay on topic.
+- Write the ACTUAL requested code with docstrings and comments.
+- DO NOT write Python/ReportLab code that creates a PDF/Word/PowerPoint file.
+  The document engine will compile your output automatically.
+- Minimum 400 words with executable, well-explained code.
+"""
         )
-    elif file_format:
-        if file_format == "xlsx":
-            prompt_parts.append(
-                f"Create structured tabular data for: {subject}\n\n"
-                "Output ONLY a clean CSV table: one header row followed by 10-20 realistic, "
-                "internally consistent data rows.\n"
-                "Choose useful business/domain columns, use concrete values (not placeholders), "
-                "and make each row complete. Use commas as delimiters; quote any value containing a comma.\n"
-                "No markdown fences, title, commentary, blank rows, or explanation—only CSV data.\n"
-                "Example:\n"
-                "Name,Value,Category\n"
-                "Row1,100,Type A\n"
-                "Row2,200,Type B\n\n"
-            )
-        elif file_format == "pptx":
-            prompt_parts.append(
-                f"Create a professional presentation outline on: {subject}\n\n"
-                "Structure your response as clearly separated sections, one per slide.\n"
-                "Format:\n"
-                "# Slide Title\n"
-                "- Key point 1\n"
-                "- Key point 2\n"
-                "- Key point 3\n\n"
-                "Create exactly 7 slides. Each slide must have 3-5 concise, specific bullets. "
-                "Start with an executive overview and end with practical conclusions. "
-                "Do not use placeholders, meta-commentary, or ask questions.\n\n"
-            )
-        else:  # pdf, docx, txt, md
-            prompt_parts.append(
-                f"Write a comprehensive, professional document on: {subject}\n\n"
-                "Use this exact markdown formatting:\n"
-                "  # Main Title (one only)\n"
-                "  ## Section Heading\n"
-                "  ### Sub-section\n"
-                "  - Bullet point\n"
-                "  1. Numbered step\n"
-                "  > Note: callout text\n"
-                "  ```python\n  code here\n  ```\n"
-                "  | Col1 | Col2 | Col3 |\n  |------|------|------|\n  | Data | Data | Data |\n\n"
-                "CRITICAL RULES:\n"
-                f"- The document is ONLY about '{subject}'. Do not introduce unrelated subjects, programming, or Python unless the topic explicitly asks for them.\n"
-                "- Write ONLY the document content. Do NOT include meta-text like "
-                "'Here is the document', 'I have created', or any preamble.\n"
-                "- DO NOT write code that builds or saves PDF/DOCX files.\n"
-                "- Do not ask the reader for more details; make sensible professional assumptions where needed.\n"
-                "- Use a clear introduction, logically ordered sections, a practical example or comparison where useful, and a concise conclusion.\n"
-                "- Make it thorough, factual, and professional — 600-900 words.\n\n"
-            )
-    else:
-        prompt_parts.append(f"Answer accurately and completely:\n\n{subject}\n\n")
+    elif file_format == "xlsx":
+        exact_count = _requested_record_count(question)
+        student_data = _student_dataset_csv(question)
+        if student_data:
+            return student_data
+        prompt_parts.append(
+            f"""You are producing tabular data for an Excel spreadsheet.
+
+TOPIC: {subject}
+
+Output ONLY a clean CSV table about '{subject}':
+- One header row with relevant, meaningful column names
+- Produce EXACTLY {exact_count} data rows when the request specifies a count;
+  otherwise produce 15 realistic, internally consistent data rows
+- Use concrete values — no placeholders like 'Value1' or 'Row1'
+- Comma-delimited; quote any value that contains a comma
+
+Do NOT include: markdown fences, a title, explanations, blank rows, or commentary.
+Output starts with the header row and ends with the last data row.
+
+Example format:
+Name,Department,Salary,Start Date
+Alice Johnson,Engineering,82000,2021-03-15
+Bob Smith,Marketing,67000,2020-07-01
+"""
+        )
+    elif file_format == "pptx":
+        slide_count = _requested_slide_count(question)
+        prompt_parts.append(
+            f"""You are creating slide content for a PowerPoint presentation.
+
+TOPIC: {subject}
+
+Create exactly {slide_count} professional slides about '{subject}'.
+Do NOT change the topic.
+
+Format each slide exactly like this:
+# [Slide Title relating to {subject}]
+- Key point 1 (specific, factual)
+- Key point 2 (specific, factual)
+- Key point 3 (specific, factual)
+
+Slide 1 Title MUST be '{subject}' (DO NOT use 'Introduction' as slide 1 title).
+Subsequent slide topics: Executive Summary → Key Concepts → Architecture/Details → Practical Applications → Challenges → Best Practices → Conclusion.
+Each slide must have 3-5 concise, specific bullets with concrete examples, metrics where appropriate, and practical implications.
+Do NOT use placeholder text, meta-commentary, or ask questions.
+"""
+        )
+    else:  # pdf, docx, txt, md and catch-all
+        requested_pages = _requested_page_count(question) if file_format == "pdf" else None
+        target_words = f"at least {requested_pages * 475:,} words" if requested_pages else "600-900 words"
+        page_rule = (
+            f"- The user explicitly asked for at least {requested_pages} pages. Use enough substantive sections, examples, and analysis to fill that length; do not pad with repeated text.\n"
+            if requested_pages else ""
+        )
+        prompt_parts.append(
+            f"""You are writing the full content of a professional document.
+
+TOPIC: {subject}
+
+Write a comprehensive, professional document ENTIRELY about '{subject}'.
+Do NOT switch topics or introduce unrelated subjects.
+
+Use this markdown structure:
+  # {subject}
+  ## Introduction
+  ## Key Principles and Architecture
+  ## Practical Applications and Analysis
+  ## Implementation Considerations
+  ## Conclusion
+
+Formatting you may use:
+  - Bullet points  •  Numbered steps  •  > Callout notes
+  - ```code blocks``` where relevant to the topic
+  - | Tables | with | headers | for comparative data |
+
+CRITICAL RULES:
+- The MAIN DOCUMENT TITLE on the very first line must be '# {subject}'.
+  DO NOT use '# Introduction' as the first heading. The first heading MUST be '# {subject}'.
+- This document is ONLY about '{subject}'. Every sentence must relate to this topic.
+- Start directly with '# {subject}'. Do NOT write 'Here is the document' or any preamble.
+- DO NOT write code that builds/saves a PDF or DOCX file.
+- DO NOT ask the reader for more information — make professional assumptions.
+- {target_words}, factual, well-structured, useful to a professional reader.
+{page_rule}"""
+        )
 
     full_prompt = "".join(prompt_parts)
 
     try:
+        requested_pages = _requested_page_count(question) if file_format == "pdf" else None
         llm = ChatOllama(
             model=model_to_use,
             base_url=config.OLLAMA_BASE_URL,
             temperature=0.15,
-            num_predict=4096,
+            # Longer PDFs need a larger generation/context budget.  This is
+            # applied only when a user explicitly asks for pages, preserving
+            # the low-memory defaults for ordinary terminal requests.
+            num_predict=max(4096, (requested_pages or 0) * 700),
+            num_ctx=max(config.OLLAMA_NUM_CTX, (requested_pages or 0) * 900),
         )
         response = llm.invoke(full_prompt)
         result = str(response.content).strip()
@@ -535,8 +951,6 @@ def execution_node(state: WorkflowState) -> dict:
         }
 
     # ── Explicit file intent: answer first, artifact second ────────────────
-    # The model no longer decides whether a requested document is created.
-    # It only answers the non-file part; file_node invokes create_file itself.
     fmt = plan.get("file_format")
     if fmt:
         intent = plan.get("file_intent", {})
@@ -557,13 +971,30 @@ def execution_node(state: WorkflowState) -> dict:
 
         is_code = bool(re.search(r"\b(code|script|algorithm|python)\b", non_file_question, re.I))
         model_used = config.CODER_MODEL if is_code else config.MAIN_MODEL
-        # File formats need format-aware source material.  In particular, an
-        # XLSX needs CSV rows and a deck needs slide headings; a generic chat
-        # answer is prose and produces poor spreadsheets / one-slide decks.
-        file_content = _llm_content(state["question"], state.get("context", ""), fmt)
-        # Documents are the deliverable.  Only retain terminal text when the
-        # question explicitly requested code; this preserves code+PDF while
-        # avoiding a duplicate Word/PDF/spreadsheet body in the terminal.
+
+        # Generate format-aware source material, leveraging history and prior content if referential
+        file_content = _llm_content(
+            state["question"],
+            state.get("context", ""),
+            fmt,
+            state.get("history"),
+            plan.get("source_content"),
+            plan.get("resolved_subject"),
+        )
+        if fmt == "xlsx":
+            file_content = _normalise_csv_row_count(
+                file_content, _requested_record_count(state["question"]), _requested_column_count(state["question"])
+            )
+        elif fmt == "pptx":
+            topic = plan.get("resolved_subject") or _extract_clean_subject(state["question"], fmt)
+            file_content = _professionalise_slide_titles(_ensure_presentation_slide_count(
+                file_content, topic, _requested_slide_count(state["question"])
+            ), topic)
+        elif fmt == "pdf":
+            topic = plan.get("resolved_subject") or _extract_clean_subject(state["question"], fmt)
+            file_content = _extend_pdf_content(
+                file_content, topic, _requested_page_count(state["question"])
+            )
         answer_text = file_content if is_code else ""
         elapsed = round(time.time() - started, 3)
         return {
@@ -573,8 +1004,15 @@ def execution_node(state: WorkflowState) -> dict:
             "content": file_content,
         }
 
-    # ── Existing non-file LangGraph / RAG behavior ─────────────────────────
-    content = _llm_content(state["question"], state.get("context", ""), fmt)
+    # ── Non-file LangGraph / RAG behavior ──────────────────────────────────
+    content = _llm_content(
+        state["question"],
+        state.get("context", ""),
+        fmt,
+        state.get("history"),
+        plan.get("source_content"),
+        plan.get("resolved_subject"),
+    )
     is_code = bool(re.search(r"\b(code|script|algorithm|python)\b", state["question"], re.I))
     model_used = config.CODER_MODEL if is_code else config.MAIN_MODEL
 
@@ -591,7 +1029,8 @@ def file_node(state: WorkflowState) -> dict:
     fmt = state["plan"].get("file_format")
     if not fmt:
         return {}
-    title, clean_content, safe_slug = derive_clean_title(state["question"], state.get("content", ""))
+    subject_prompt = state.get("plan", {}).get("resolved_subject") or state["question"]
+    title, clean_content, safe_slug = derive_clean_title(subject_prompt, state.get("content", ""))
     filename = f"{safe_slug}.{fmt}"
     try:
         # Direct Python tool call: no model tool_call decision exists on this

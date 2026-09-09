@@ -12,7 +12,7 @@ import os
 import re
 from pathlib import Path
 
-from artifacts import OUTPUT_DIR, SUPPORTED_FORMATS, create_artifact
+from artifacts import OUTPUT_DIR, SUPPORTED_FORMATS, create_artifact, derive_clean_title
 from image_gen import generate_image
 
 # ── Output directory (defaults to ~/Downloads/AgentOTG) ────────────────────────
@@ -61,85 +61,23 @@ def _valid_output_path(filename: object, extension: str) -> str:
 # ── write_docx tool ──────────────────────────────────────────────────────────
 
 def write_docx(title: str, content: str, filename: str = "output.docx") -> str:
-    """Write a styled Word (.docx) document with colored heading, underline bar, and styled lists."""
+    """Write a styled Word (.docx) document with colored heading, underline bar, tables, and styled lists."""
     try:
-        from docx import Document
-        from docx.shared import Inches, Pt, RGBColor
-        from docx.oxml import OxmlElement
-        from docx.oxml.ns import qn
-
+        from artifacts import _generate_docx
         if not isinstance(title, str) or not isinstance(content, str):
             return "❌ Title and content must be non-empty text."
-        target_path = _valid_output_path(filename or "output.docx", ".docx")
+
+        clean_title, clean_content, safe_slug = derive_clean_title(title, content)
+        title = clean_title
+        content = clean_content
+
+        target_name = f"{safe_slug}.docx" if not filename or any(p in filename.lower() for p in ["output", "document", "give", "write", "create", "generate", "agent", "prompt"]) else filename
+        target_path = _valid_output_path(target_name, ".docx")
         if not target_path:
             return "❌ Invalid output filename."
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
-        doc = Document()
-        # Set clean 1-inch margins
-        for sec in doc.sections:
-            sec.top_margin = Inches(1.0)
-            sec.bottom_margin = Inches(1.0)
-            sec.left_margin = Inches(1.0)
-            sec.right_margin = Inches(1.0)
-
-        teal_color = RGBColor(8, 126, 112)
-
-        # Title with colored heading
-        p_title = doc.add_paragraph()
-        p_title.paragraph_format.space_before = Pt(0)
-        p_title.paragraph_format.space_after = Pt(4)
-        run_title = p_title.add_run(title)
-        run_title.font.name = "Calibri"
-        run_title.font.size = Pt(24)
-        run_title.font.bold = True
-        run_title.font.color.rgb = teal_color
-
-        # Thin colored bar / horizontal line under title
-        p_bar = doc.add_paragraph()
-        p_bar.paragraph_format.space_before = Pt(0)
-        p_bar.paragraph_format.space_after = Pt(12)
-        pPr = p_bar._p.get_or_add_pPr()
-        pBdr = OxmlElement("w:pBdr")
-        bottom = OxmlElement("w:bottom")
-        bottom.set(qn("w:val"), "single")
-        bottom.set(qn("w:sz"), "12")
-        bottom.set(qn("w:space"), "1")
-        bottom.set(qn("w:color"), "087E70")
-        pBdr.append(bottom)
-        pPr.append(pBdr)
-
-        # Content parsing: bullet lists and proper paragraph spacing
-        for line in (content or "").splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped.startswith(("- ", "* ")):
-                bullet_text = stripped[2:].strip()
-                p_bullet = doc.add_paragraph(bullet_text, style="List Bullet")
-                p_bullet.paragraph_format.space_after = Pt(4)
-            elif stripped.startswith("### "):
-                p_sub = doc.add_heading(stripped[4:].strip(), level=3)
-                p_sub.paragraph_format.space_before = Pt(8)
-                p_sub.paragraph_format.space_after = Pt(3)
-            elif stripped.startswith("## "):
-                p_h2 = doc.add_heading(stripped[3:].strip(), level=2)
-                p_h2.paragraph_format.space_before = Pt(12)
-                p_h2.paragraph_format.space_after = Pt(4)
-                if p_h2.runs:
-                    p_h2.runs[0].font.color.rgb = teal_color
-            elif stripped.startswith("# "):
-                p_h1 = doc.add_heading(stripped[2:].strip(), level=1)
-                p_h1.paragraph_format.space_before = Pt(14)
-                p_h1.paragraph_format.space_after = Pt(6)
-                if p_h1.runs:
-                    p_h1.runs[0].font.color.rgb = teal_color
-            else:
-                p_body = doc.add_paragraph(stripped)
-                p_body.paragraph_format.space_after = Pt(6)
-                p_body.paragraph_format.line_spacing = Pt(14)
-
-        doc.save(target_path)
+        _generate_docx(title, content, Path(target_path))
         size = os.path.getsize(target_path)
         return f"✅ Word document saved to: {target_path}\n   Size: {size:,} bytes"
     except Exception as exc:
@@ -308,7 +246,13 @@ def generate_pdf_from_text(title: str, content: str, filename: str = "output.pdf
 
         if not isinstance(title, str) or not isinstance(content, str):
             return "❌ Title and content must be non-empty text."
-        target_path = _valid_output_path(filename or "output.pdf", ".pdf")
+
+        clean_title, clean_content, safe_slug = derive_clean_title(title, content)
+        title = clean_title
+        content = clean_content
+
+        target_name = f"{safe_slug}.pdf" if not filename or any(p in filename.lower() for p in ["output", "document", "give", "write", "create", "generate", "agent", "prompt"]) else filename
+        target_path = _valid_output_path(target_name, ".pdf")
         if not target_path:
             return "❌ Invalid output filename."
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
@@ -341,8 +285,15 @@ def generate_pdf_from_text(title: str, content: str, filename: str = "output.pdf
             spaceAfter=4,
         )
 
-        story = []
-        clean_title = (title or "Document").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # Determine effective title
+        clean_t, clean_c, safe_slug = derive_clean_title(title, content)
+        title = clean_t
+        content = clean_c
+        effective_title = title.strip() if isinstance(title, str) and title.strip() else "Executive Document"
+        if effective_title.lower() in ("document", "introduction", "overview", "summary", "output"):
+            effective_title = "Executive Document"
+        # Escape XML/HTML entities for safe PDF rendering
+        clean_title = effective_title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         story.append(Paragraph(clean_title, title_style))
         story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor(teal_hex), spaceAfter=12))
 
@@ -399,7 +350,12 @@ def generate_pptx(title: str, slides_content: list, filename: str = "output.pptx
                 pass
         if not isinstance(title, str) or not isinstance(slides_content, list):
             return "❌ title must be text and slides_content must be a list."
-        target_path = _valid_output_path(filename or "output.pptx", ".pptx")
+
+        clean_title, _, safe_slug = derive_clean_title(title, str(slides_content))
+        title = clean_title
+
+        target_name = f"{safe_slug}.pptx" if not filename or any(p in filename.lower() for p in ["output", "document", "give", "write", "create", "generate", "agent", "prompt"]) else filename
+        target_path = _valid_output_path(target_name, ".pptx")
         if not target_path:
             return "❌ Invalid output filename."
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
@@ -537,7 +493,12 @@ def generate_xlsx(title: str, headers: list[str], rows: list[list], filename: st
                 pass
         if not isinstance(title, str) or not isinstance(headers, list) or not isinstance(rows, list):
             return "❌ title must be text; headers and rows must be lists."
-        target_path = _valid_output_path(filename or "output.xlsx", ".xlsx")
+
+        clean_title, _, safe_slug = derive_clean_title(title, "")
+        title = clean_title
+
+        target_name = f"{safe_slug}.xlsx" if not filename or any(p in filename.lower() for p in ["output", "document", "give", "write", "create", "generate", "agent", "prompt"]) else filename
+        target_path = _valid_output_path(target_name, ".xlsx")
         if not target_path:
             return "❌ Invalid output filename."
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
@@ -568,12 +529,19 @@ def generate_xlsx(title: str, headers: list[str], rows: list[list], filename: st
         ws.row_dimensions[1].height = 24
 
         for row_idx, row_data in enumerate(rows or [], start=2):
-            ws.append(list(row_data))
+            from artifacts import _parse_cell_value
+            parsed_row = [_parse_cell_value(c) for c in row_data]
+            ws.append(parsed_row)
             is_alt = (row_idx % 2 == 0)
             for col_idx in range(1, len(row_data) + 1):
                 cell = ws.cell(row=row_idx, column=col_idx)
                 cell.font = body_font
-                cell.alignment = body_align
+                if isinstance(cell.value, (int, float)):
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                elif isinstance(cell.value, bool):
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    cell.alignment = body_align
                 cell.border = thin_border
                 if is_alt:
                     cell.fill = alt_fill
@@ -586,7 +554,7 @@ def generate_xlsx(title: str, headers: list[str], rows: list[list], filename: st
                 val = str(cell.value or "")
                 if len(val) > max_len:
                     max_len = len(val)
-            ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+            ws.column_dimensions[col_letter].width = min(max(max_len + 4, 12), 45)
 
         wb.save(target_path)
         row_count = len(rows or [])

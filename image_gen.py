@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import importlib.util
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -68,12 +69,30 @@ def _get_pipeline():
             device = "cpu"
             torch_dtype = torch.float32
 
-        pipe = AutoPipelineForText2Image.from_pretrained(
-            "stabilityai/sd-turbo",
-            torch_dtype=torch_dtype,
-            variant="fp16" if device == "cuda" else None,
-        )
+        from config import IMAGE_GEN_LOCAL_ONLY, IMAGE_GEN_MODEL
+
+        load_args = {"torch_dtype": torch_dtype, "local_files_only": IMAGE_GEN_LOCAL_ONLY}
+        # fp16 variants are useful on CUDA, but not every compatible model
+        # publishes one.  Retrying without it makes model selection robust.
+        if device == "cuda":
+            load_args["variant"] = "fp16"
+        # Agent OTG normally blocks outbound traffic.  A first-time model
+        # download is the sole intentional exception and only happens when
+        # IMAGE_GEN_LOCAL_ONLY=false; later runs use the Hugging Face cache.
+        try:
+            from offline_guard import allow_external
+            download_context = nullcontext() if IMAGE_GEN_LOCAL_ONLY else allow_external()
+        except ImportError:
+            download_context = nullcontext()
+        with download_context:
+            try:
+                pipe = AutoPipelineForText2Image.from_pretrained(IMAGE_GEN_MODEL, **load_args)
+            except Exception:
+                load_args.pop("variant", None)
+                pipe = AutoPipelineForText2Image.from_pretrained(IMAGE_GEN_MODEL, **load_args)
         pipe.to(device)
+        if device == "cpu":
+            pipe.enable_attention_slicing()
         _PIPELINE = pipe
         return _PIPELINE
     except Exception as exc:
@@ -101,10 +120,18 @@ def generate_image(prompt: str, filename: str = "generated.png") -> str:
 
     try:
         pipe = _get_pipeline()
-        # SD-Turbo operates in 1 step with guidance_scale=0.0
-        result = pipe(prompt=str(prompt).strip(), num_inference_steps=1, guidance_scale=0.0)
+        from config import IMAGE_GEN_MODEL, IMAGE_GEN_SIZE
+        # SD-Turbo operates in one step; use sensible values for other local
+        # diffusion checkpoints without requiring the user to edit code.
+        is_turbo = "turbo" in IMAGE_GEN_MODEL.lower()
+        result = pipe(prompt=str(prompt).strip(),
+                      num_inference_steps=1 if is_turbo else 20,
+                      guidance_scale=0.0 if is_turbo else 7.0,
+                      width=IMAGE_GEN_SIZE, height=IMAGE_GEN_SIZE)
         image = result.images[0]
         image.save(target_path)
         return f"✅ Image saved to: {target_path}"
     except Exception as exc:
-        return f"❌ Failed to generate image: {exc}"
+        return (f"❌ Failed to generate image: {exc}. "
+                "Check IMAGE_GEN_MODEL, then retry; its weights download once when "
+                "IMAGE_GEN_LOCAL_ONLY=false and are cached for later offline use.")

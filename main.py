@@ -596,7 +596,7 @@ def ask_agent(q: Question):
 
         return {
             "type":         "agent",
-            "model_used":   "qwen2.5:14b (LangGraph)",
+            "model_used":   "qwen2.5:7b (LangGraph)",
             "time_seconds": elapsed,
             "needs_tool":   needs_tool,
             "tool_log":     tool_log,

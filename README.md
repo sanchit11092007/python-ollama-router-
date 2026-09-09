@@ -17,16 +17,14 @@ Ensure the Ollama service is active. Check that the required models are download
 ollama list
 ```
 The recommended models for full functionality:
-- `qwen2.5:7b` (Router & quick casual answers)
+- `qwen2.5:7b` (Router, general reasoning & LangGraph agent)
 - `qwen2.5-coder:latest` (Code generation & debugging)
-- `qwen2.5:14b` (In-depth reasoning, essays, LangGraph agent)
 - `qwen2.5vl:7b` (Vision & image analysis)
 
 If any model is missing, pull it using:
 ```powershell
 ollama pull qwen2.5:7b
 ollama pull qwen2.5-coder:latest
-ollama pull qwen2.5:14b
 ollama pull qwen2.5vl:7b
 ```
 
@@ -61,13 +59,13 @@ This opens an interactive shell with an automated capability showcase, command m
 | Capability | Command / Input Example | Assigned Model | Description |
 | :--- | :--- | :--- | :--- |
 | **💻 Code Writing & Debugging** | `Write a python script to parse CSV files` | `qwen2.5-coder:latest` | Auto-detects programming tasks and routes to the coder model |
-| **🔄 Code + Walkthrough** | `Write a quicksort in Python and explain how it works` | `qwen2.5-coder` ➔ `qwen2.5:14b` | **Sequential Pipeline**: generates code first, then passes it to the reasoning model for explanation |
-| **🧠 Deep Reasoning & Essays** | `Explain the trade-offs of microservices vs monoliths` | `qwen2.5:14b` | Complex analysis, architectural reasoning, essays |
+| **🔄 Code + Walkthrough** | `Write a quicksort in Python and explain how it works` | `qwen2.5-coder` ➔ `qwen2.5:7b` | **Sequential Pipeline**: generates code first, then passes it to the reasoning model for explanation |
+| **🧠 Deep Reasoning & Essays** | `Explain the trade-offs of microservices vs monoliths` | `qwen2.5:7b` | Complex analysis, architectural reasoning, essays |
 | **⚡ Quick Answers & Math** | `What is the capital of France?` or `25 * 14` | `qwen2.5:7b` | Rapid lightweight answers |
 | **🗂️ Force-Split Complex Tasks** | `/complex Write an intro email AND generate 3 SQL queries` | Multi-Model Split | Decomposes prompt into independent sub-tasks |
 | **👁️ Vision & Image Q&A** | `/image "C:\path\diagram.png" Explain this flowchart` | `qwen2.5vl:7b` | Accepts local image files or public URLs (PNG, JPEG, WEBP) |
 | **📄 Document Ingestion** | `upload "C:\data\sales.xlsx"` then ask `What are the total sales?` | Context Injector | Ingests `.xlsx`, `.pdf`, or `.docx` for subsequent Q&A |
-| **🛠️ LangGraph Agent** | `/agent Create a Word document titled 'Report' with key points` | `qwen2.5:14b` + Tools | Multi-step agent that can create DOCX, manipulate PDFs, and search RAG docs |
+| **🛠️ LangGraph Agent** | `/agent Create a Word document titled 'Report' with key points` | `qwen2.5:7b` + Tools | Multi-step agent that can create DOCX, manipulate PDFs, and search RAG docs |
 | **📜 Past Sessions** | `history` | Session Store | Interactive browser for saved conversation transcripts |
 | **🧹 Clear Memory** | `reset` | Memory Guard | Clears conversation context to start a fresh topic |
 | **❓ Help Menu** | `help` or `/help` | Guide | Displays the full capability matrix and practical prompt examples |

@@ -38,6 +38,7 @@ from reportlab.platypus import (
 # ── Output directory: ~/Downloads/AgentOTG/ ───────────────────────────────────
 OUTPUT_DIR = Path(os.environ.get("USERPROFILE", Path.home())) / "Downloads" / "AgentOTG"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+LOGO_PATH = Path(__file__).resolve().parent / "logo" / "otglogo.png"
 
 SUPPORTED_FORMATS = {"pdf", "docx", "txt", "md", "pptx", "xlsx", "csv", "json"}
 
@@ -82,18 +83,196 @@ def _paragraphs(content: str) -> list[str]:
 
 
 def _rows(content: str) -> list[list[str]]:
-    rows = [row for row in csv.reader((content or "").splitlines()) if any(cell.strip() for cell in row)]
-    return rows or [["Content"], [content.strip() or "No content supplied"]]
+    """Parse tabular content from CSV, TSV, or Markdown tables into normalized rows.
+    Strips markdown code fences (```csv) and conversational preambles safely.
+    """
+    if not content or not str(content).strip():
+        return [["Content"], ["No content supplied"]]
+
+    text = str(content).strip()
+
+    # 1. If fenced code block is present, extract content inside fences
+    fence_pattern = re.compile(r"```(?:csv|tsv|excel|markdown|table)?\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE)
+    fence_match = fence_pattern.search(text)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    else:
+        # Strip any leading or trailing fence line
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text).strip()
+
+    raw_lines = text.splitlines()
+    cleaned_lines = []
+
+    for line in raw_lines:
+        s = line.strip()
+        if not s or s.startswith("```"):
+            continue
+        cleaned_lines.append(s)
+
+    if not cleaned_lines:
+        return [["Content"], ["No content supplied"]]
+
+    # 2. Check if content is a Markdown table (lines starting with | and containing |)
+    pipe_lines = [l for l in cleaned_lines if l.startswith("|") and "|" in l[1:]]
+    if len(pipe_lines) >= 2:
+        table_rows = []
+        for pl in pipe_lines:
+            # Skip separator rows like |---|---| or |:---|:---|
+            if re.match(r"^\|[-| :]+\|$", pl):
+                continue
+            cells = [c.strip() for c in pl.strip("|").split("|")]
+            if any(cells):
+                table_rows.append(cells)
+        if len(table_rows) >= 1:
+            max_cols = max(len(r) for r in table_rows)
+            return [r + [""] * (max_cols - len(r)) for r in table_rows]
+
+    # 3. Check CSV / TSV format
+    data_lines = []
+    for l in cleaned_lines:
+        # Ignore conversational preambles/postambles
+        if re.match(r"^(?:here is|here's|below is|the following|sure|certainly|table:|data:|hope this helps|let me know|regards|thank)", l, re.I):
+            continue
+        data_lines.append(l)
+
+    if not data_lines:
+        data_lines = cleaned_lines
+
+    # Delimiter detection: tab vs comma
+    sample = "\n".join(data_lines[:5])
+    delimiter = "\t" if "\t" in sample and sample.count("\t") >= sample.count(",") else ","
+
+    try:
+        reader = csv.reader(data_lines, delimiter=delimiter)
+        rows = [[cell.strip() for cell in row] for row in reader if any(cell.strip() for cell in row)]
+    except Exception:
+        rows = []
+
+    if rows:
+        max_cols = max(len(r) for r in rows)
+        return [r + [""] * (max_cols - len(r)) for r in rows]
+
+    return [["Content"], [content.strip() or "No content supplied"]]
+
+
+def _parse_cell_value(val: Any) -> Any:
+    """Parse cell string into native Python int, float, or bool for Excel.
+    Preserves strings with leading zeroes (e.g. '0123') and alphanumeric IDs ('STU-001').
+    """
+    if not isinstance(val, str):
+        return val
+    s = val.strip()
+    if not s:
+        return ""
+    # Booleans
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+    # Integers: allow negative, preserve leading zero codes (e.g. "01234") unless it's "0"
+    if re.fullmatch(r"-?\d+", s):
+        if len(s) > 1 and s.startswith("0"):
+            return s
+        if len(s) > 2 and s.startswith("-0"):
+            return s
+        try:
+            return int(s)
+        except ValueError:
+            return s
+    # Floats: e.g. "12.34", "-0.5"
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        try:
+            return float(s)
+        except ValueError:
+            return s
+    # Currency values: e.g. "$1,250.00", "$45", "€100"
+    m_curr = re.fullmatch(r"[\$€£¥]\s*(-?[\d,]+(?:\.\d+)?)", s)
+    if m_curr:
+        raw_num = m_curr.group(1).replace(",", "")
+        try:
+            return float(raw_num) if "." in raw_num else int(raw_num)
+        except ValueError:
+            return s
+    return s
+
+
+def _clean_topic_from_question(question: str) -> str:
+    """Extract a clean, concise, 2-5 word professional topic title from a question prompt."""
+    if not question:
+        return "Generated Document"
+    q = question.strip()
+
+    # 1. Remove leading conversational phrases
+    q = re.sub(r"^\s*(?:please\s+)?(?:can you\s+)?(?:give me|show me|write|create|generate|make|build|export|produce|draft|prepare|provide)\s+", "", q, flags=re.I)
+
+    # 2. Remove file format nouns and dataset/report descriptors at the start
+    q = re.sub(r"^\s*(?:(?:a|an|the)\s+)?(?:pdf|docx|doc|word(?:\s+document|\s+doc|\s+file|\s+report)?|excel(?:\s+sheet|\s+file)?|xlsx|"
+               r"spreadsheet|powerpoint|pptx|ppt|presentation|report|file|script|code|program|dataset|data)\s*", "", q, flags=re.I)
+
+    # 3. Remove leading prepositions ('about', 'on', 'for', 'covering', 'regarding', 'of', 'with')
+    q = re.sub(r"^\s*(?:about|on|for|covering|regarding|of|related\s+to|titled|named|called)\s+", "", q, flags=re.I)
+
+    # 4. Remove second wave of file descriptors if chained (e.g. "report on", "dataset of", "python script for")
+    q = re.sub(r"^\s*(?:(?:a|an|the)\s+)?(?:report|document|presentation|spreadsheet|dataset|file|sheet|code|script)\s+(?:about|on|for|covering|regarding|of|to)\s+", "", q, flags=re.I)
+    q = re.sub(r"^\s*(?:(?:a|an|the)\s+)?(?:python|javascript|java|c\+\+|sql|bash|shell)?\s*(?:script|code|program|function|class)\s+(?:for|to|of|about)\s+", "", q, flags=re.I)
+
+
+    # 5. Remove trailing file creation clauses (e.g. "and also generate the pdf", "and put it in a word file")
+    q = re.sub(
+        r"(?:,?\s*(?:and\s+)?(?:also\s+)?)?(?:generate|create|make|build|export|produce|save|put|write|draft|prepare|provide)"
+        r"(?:\s+it)?(?:\s+as|\s+in|\s+to)?(?:\s+an?|\s+the)?\s*"
+        r"(?:pdf|docx|doc|word(?:\s+document|\s+doc|\s+file)?|excel(?:\s+sheet|\s+file)?|xlsx|spreadsheet|"
+        r"powerpoint|pptx|ppt|presentation|report|file)\b.*$",
+        "", q, flags=re.I,
+    )
+
+    # 6. Remove trailing constraint instructions ("with 5 key sections", "in 10 points", "with 3 bullets", "and 5 sample rows")
+    q = re.sub(
+        r"(?:,?\s*)?(?:with|containing|including|having|in)\s+\d+\s+(?:key\s+)?(?:sections?|points?|bullets?|highlights?|rows?|columns?|pages?|sample\s+rows?).*$",
+        "", q, flags=re.I,
+    )
+    # Remove trailing format specifications (e.g. "in docx and pdf and ppt", "as a pdf", "in word format")
+    q = re.sub(
+        r"(?:,?\s*)?(?:in|as|into|to)\s+(?:(?:an?|the)\s+)?(?:pdf|docx?|doc|word(?:\s+document|\s+doc|\s+file)?|excel(?:\s+sheet|\s+file)?|xlsx|spreadsheet|powerpoint|pptx?|ppt|presentation|markdown|text|json|csv)(?:\s*(?:and|,|/|\+)\s*(?:an?\s+)?(?:pdf|docx?|doc|word(?:\s+document|\s+doc|\s+file)?|excel(?:\s+sheet|\s+file)?|xlsx|spreadsheet|powerpoint|pptx?|ppt|presentation|markdown|text|json|csv))*\s*(?:format|file|document|deck)?\s*$",
+        "", q, flags=re.I
+    )
+    # Remove "in python", "in excel", "in word" if at the very end
+    q = re.sub(r"\s+(?:in|using)\s+(?:python|excel|word|powerpoint)\s*$", "", q, flags=re.I)
+
+    # 7. Strip surrounding punctuation
+    q = q.strip(" ,.;:-_")
+    q = re.sub(r"^\s*(?:about|on|for|covering|regarding|of)\s+", "", q, flags=re.I).strip(" ,.;:-_")
+
+    if not q or len(q) < 2:
+        return "Generated Document"
+
+    # Title case formatting for clean presentation
+    words = q.split()
+    if len(words) <= 6:
+        q = " ".join(w.capitalize() if w.lower() not in ("a", "an", "the", "in", "on", "for", "and", "of", "to", "with", "vs") else w.lower() for w in words)
+        q = q[0].upper() + q[1:] if q else q
+
+    return q
 
 
 def derive_clean_title(question: str, content: str = "") -> tuple[str, str, str]:
     """
     Derives a clean document title, sanitized content (without duplicated title heading),
     and a filesystem-safe slug for the filename.
-    Prevents raw prompt instructions (e.g. 'Give me the code to...') from becoming the main heading.
+    Prevents raw prompt instructions (e.g. 'Give me the code to...') and generic section
+    headings (e.g. 'Introduction', 'Overview', 'Summary') from becoming the main heading or filename.
     """
+    GENERIC_TITLES = {
+        "introduction", "intro", "overview", "summary", "executive summary",
+        "table of contents", "background", "abstract", "preface",
+        "contents", "agenda", "slide 1", "slide", "title", "document",
+        "output", "report", "presentation", "presentation brief",
+        "brief", "notes", "section 1", "chapter 1",
+    }
+
     # 0. Check if user explicitly asked for a title in quotes, e.g. titled "Q3 Report"
-    quoted_title_match = re.search(r'(?:title|titled|named)\s+["\'"]([^"\']+)["\'"]', question or "", re.I)
+    quoted_title_match = re.search(r'(?:title|titled|named|called)\s+["\'"]([^"\']+)["\'"]', question or "", re.I)
     if quoted_title_match:
         explicit_title = quoted_title_match.group(1).strip()
         slug = re.sub(r'[^a-zA-Z0-9]+', '_', explicit_title.lower()).strip('_')
@@ -106,56 +285,75 @@ def derive_clean_title(question: str, content: str = "") -> tuple[str, str, str]
     title_from_content = ""
     new_content_lines = []
     found_heading = False
+
     for i, line in enumerate(content_lines):
         stripped = line.strip()
         if not found_heading and i < 5 and (stripped.startswith("#") or stripped.lower().startswith("title:")):
             if stripped.startswith("#"):
-                title_from_content = re.sub(r"^#+\s*", "", stripped).strip()
+                raw_h = re.sub(r"^#+\s*", "", stripped).strip()
             else:
-                title_from_content = re.sub(r"^title:\s*", "", stripped, flags=re.I).strip()
-            title_from_content = re.sub(r"[\*`_]", "", title_from_content).strip()
-            if len(title_from_content) > 2 and not title_from_content.lower().startswith(("give me", "write code to", "user request", "prompt:")):
+                raw_h = re.sub(r"^title:\s*", "", stripped, flags=re.I).strip()
+            raw_h = re.sub(r"[\*`_]", "", raw_h).strip()
+
+            # Check if this heading is a raw prompt command rather than a document title
+            is_prompt_command = bool(re.match(
+                r"^\s*(?:please\s+)?(?:can you\s+)?(?:give me|write|create|generate|make|build|export|produce)\s+(?:an?\s+)?(?:pdf|word|docx?|excel|xlsx|pptx?|powerpoint|spreadsheet|report|file)\b",
+                raw_h, re.I
+            ))
+
+            # Generic headings like 'Introduction', 'Overview', 'Summary' are section titles, not document titles
+            clean_raw_h = raw_h.lower().strip(" :.-_")
+            is_generic_heading = clean_raw_h in GENERIC_TITLES or bool(re.match(
+                r"^\s*(?:introduction|intro|overview|summary|executive\s+summary|background|abstract|preface|"
+                r"table\s+of\s+contents|contents|agenda|slide\s*\d*|section\s*\d*|chapter\s*\d*|title|document|report|brief)\s*[:\-–—]?\s*$",
+                raw_h.strip(), re.I
+            ))
+
+            if is_generic_heading or stripped.startswith("##"):
+                # The document begins directly with section headings (e.g. ## Introduction).
+                # Do NOT scan later sections as the document title; preserve all lines and use topic from prompt.
+                new_content_lines.extend(content_lines[i:])
+                break
+
+            if len(raw_h) > 2 and not is_prompt_command:
+                title_from_content = raw_h
                 found_heading = True
                 continue
         new_content_lines.append(line)
 
     if found_heading and title_from_content:
-        clean_title = title_from_content
+        clean_title = re.sub(
+            r"^\s*(?:please\s+)?(?:can you\s+)?(?:give me|write|create|generate|make|build|export|produce)\s+"
+            r"(?:(?:a|an|the)\s+)?(?:pdf|docx|word(?:\s+document|\s+doc)?|excel(?:\s+sheet)?|xlsx|"
+            r"spreadsheet|powerpoint|pptx|ppt|presentation|report|file)\s*"
+            r"(?:about|on|for|covering|regarding)?\s*",
+            "", title_from_content, flags=re.I,
+        ).strip(" ,.;:-") or title_from_content
         cleaned_content = "\n".join(new_content_lines).strip()
     else:
         cleaned_content = content
-        q = (question or "").strip()
-        q = re.sub(r"^[/!]agent\s+", "", q, flags=re.I)
-        # A leading file command is an instruction, never a document topic:
-        # "Create a Word document about quarterly sales" -> "Quarterly sales".
-        q = re.sub(
-            r"^(?:please\s+)?(?:generate|create|make|build|export|produce|write)\s+"
-            r"(?:an?\s+)?(?:pdf|word(?:\s+doc(?:ument)?)?|docx|excel|xlsx|spreadsheet|"
-            r"powerpoint|pptx|ppt|slides?)\s*(?:file|document|report|presentation)?\s*"
-            r"(?:about|on|for|with)?\s*",
-            "", q, flags=re.I,
-        )
-        q = re.sub(r"[\s,]+(and\s+)?(also\s+)?(generate|generatet|save|create|make|export)(t)?(\s+it)?(\s+as|\s+in)?(\s+a|\s+the|\s+he)?\s+(pdf|word|docx|doc|excel|xlsx|csv|json|powerpoint|pptx|file|document)\b.*$", "", q, flags=re.I)
-        q = re.sub(r"[\s,]+(also\s+)?generate(t)?\s+(he|the|a)?\s*(pdf|word|docx|excel|xlsx|csv|file)\b.*$", "", q, flags=re.I)
-        q = re.sub(r"^(give\s+me(\s+the|\s+a)?|write(\s+a|\s+the)?|create(\s+a|\s+the)?|generate(\s+a|\s+the)?|show(\s+me)?|please\s+|can\s+you\s+|how\s+to\s+)", "", q, flags=re.I).strip()
-        q = re.sub(r"^(code\s+to\s+|script\s+to\s+|program\s+to\s+|solution\s+for\s+)", "", q, flags=re.I).strip()
-        q = re.sub(r"^(print\s+the\s+|print\s+)", "", q, flags=re.I).strip()
-        # Remove any surviving delivery instruction before creating a heading.
-        q = re.sub(r"\b(?:as|in)\s+(?:a\s+)?(?:pdf|word(?:\s+doc(?:ument)?)?|docx|excel|xlsx|spreadsheet|powerpoint|pptx|ppt|slides?)\b.*$", "", q, flags=re.I).strip()
-        q = q.strip(".?! ")
-        if q:
-            words = q.split()
-            clean_title = " ".join(w.capitalize() if w.lower() not in {"in", "of", "to", "for", "a", "an", "the", "and", "from", "with"} else w.lower() for w in words)
-            if clean_title:
-                clean_title = clean_title[0].upper() + clean_title[1:]
-        else:
-            clean_title = "Agent Document"
+        clean_title = _clean_topic_from_question(question)
+
+    # If clean_title is empty or in generic titles, fallback to topic from question
+    if not clean_title or clean_title.lower().strip(" :.-_") in GENERIC_TITLES:
+        clean_title = _clean_topic_from_question(question)
+    if not clean_title or clean_title.lower().strip(" :.-_") in GENERIC_TITLES:
+        clean_title = "Executive Report"
 
     clean_title = re.sub(r"^#+\s*", "", clean_title).strip()
-    slug = re.sub(r"[^a-zA-Z0-9]+", "_", clean_title.lower()).strip("_")
-    slug_parts = [p for p in slug.split("_") if p][:5]
+    clean_title = re.sub(r"\s+", " ", clean_title).strip()
+    clean_title = clean_title[:110].rstrip(" ,.;:-")
+
+    # Generate safe_name filename slug strictly from clean_title
+    slug_raw = re.sub(r"[^a-zA-Z0-9]+", "_", clean_title.lower()).strip("_")
+    meta_words = {"a", "an", "the", "in", "on", "for", "and", "of", "to", "also", "with", "me", "give", "code", "script", "generate", "create", "file", "document", "report", "pdf", "docx", "word", "excel", "xlsx", "pptx", "powerpoint", "put", "it", "as"}
+    slug_parts = [p for p in slug_raw.split("_") if p and p not in meta_words][:5]
+    if not slug_parts:
+        slug_parts = [p for p in slug_raw.split("_") if p][:5]
     safe_name = "_".join(slug_parts) if slug_parts else "document"
+
     return clean_title, cleaned_content, safe_name
+
 
 
 def _escape(text: str) -> str:
@@ -339,6 +537,11 @@ def _pdf_cover_page(canvas, document, title: str) -> None:
     canvas.setFillColor(colors.HexColor("#A0D4CE"))
     canvas.setFont("Helvetica-Bold", 8.5)
     canvas.drawString(0.72 * inch, H - 0.42 * inch, "★  AGENT OTG  |  DWE TEAM  •  EXECUTIVE INTELLIGENCE")
+    if LOGO_PATH.is_file():
+        # The supplied white, transparent logo is deliberately placed on the
+        # dark cover band so it remains crisp and legible.
+        canvas.drawImage(str(LOGO_PATH), W - 1.38 * inch, H - 1.42 * inch,
+                         width=0.72 * inch, height=0.72 * inch, mask="auto", preserveAspectRatio=True)
 
     # Divider line in header
     canvas.setStrokeColor(colors.HexColor("#04A896"))
@@ -403,6 +606,9 @@ def _pdf_header_footer(canvas, document, title: str) -> None:
 
     # Header text
     canvas.setFillColor(colors.white)
+    if LOGO_PATH.is_file():
+        canvas.drawImage(str(LOGO_PATH), 0.40 * inch, H - 0.285 * inch,
+                         width=0.19 * inch, height=0.19 * inch, mask="auto", preserveAspectRatio=True)
     canvas.setFont("Helvetica-Bold", 7.5)
     canvas.drawString(0.68 * inch, H - 0.22 * inch, "★ AGENT OTG  |  DWE TEAM")
     canvas.setFont("Helvetica", 7.5)
@@ -661,32 +867,41 @@ def _add_cell_shading(cell, fill_hex: str) -> None:
     tcPr.append(shd)
 
 
-def _build_docx_table(doc: Document, rows: list[list[str]]) -> None:
-    """Render a styled table in python-docx with brand colors and alternating fills."""
+def _build_docx_table(doc: Document, rows: list[list[str]], total_width_in: float = 6.5) -> None:
+    """Render a styled table in python-docx with brand colors, alternating fills, and distributed column widths."""
     if not rows:
         return
     col_count = max(len(r) for r in rows)
+    if col_count == 0:
+        return
     table = doc.add_table(rows=len(rows), cols=col_count)
     table.style = "Table Grid"
     table.autofit = False
 
+    col_width = Inches(total_width_in / col_count)
+    for col in table.columns:
+        col.width = col_width
+
     for r_idx, row in enumerate(rows):
         for c_idx in range(col_count):
             cell = table.cell(r_idx, c_idx)
+            cell.width = col_width
             val = row[c_idx] if c_idx < len(row) else ""
             p = cell.paragraphs[0]
-            p.paragraph_format.space_before = Pt(3)
-            p.paragraph_format.space_after  = Pt(3)
+            p.paragraph_format.space_before = Pt(4)
+            p.paragraph_format.space_after  = Pt(4)
+            p.paragraph_format.line_spacing = Pt(13)
             if r_idx == 0:
-                _add_cell_shading(cell, _TEAL)
-                _add_paragraph_run(p, val, bold=True, color_hex="FFFFFF", font_name="Calibri", size_pt=10)
+                _add_cell_shading(cell, _TEAL_DARK)
+                _add_paragraph_run(p, val.strip(), bold=True, color_hex="FFFFFF", font_name="Calibri", size_pt=10)
             else:
-                if r_idx % 2 == 0:
+                if r_idx % 2 == 1:
                     _add_cell_shading(cell, _TEAL_LIGHT)
-                _add_paragraph_run(p, val, font_name="Calibri", size_pt=10, color_hex=_INK)
+                _add_paragraph_run(p, val.strip(), font_name="Calibri", size_pt=9.5, color_hex=_INK)
 
     sp = doc.add_paragraph()
-    sp.paragraph_format.space_after = Pt(4)
+    sp.paragraph_format.space_before = Pt(2)
+    sp.paragraph_format.space_after  = Pt(4)
 
 
 def _add_left_border(p, color_hex: str, width_pt: int = 12) -> None:
@@ -740,36 +955,49 @@ def _inline_parse(text: str) -> list[tuple[str, bool, bool]]:
 
 
 def _generate_docx(title: str, content: str, path: Path) -> None:
-    """Professional Word document with line-by-line markdown rendering."""
+    """Professional Word document with clean structure, branding without logo, and typography."""
     doc = Document()
     section = doc.sections[0]
-    section.top_margin    = Inches(0.9)
-    section.bottom_margin = Inches(0.85)
-    section.left_margin   = Inches(1.1)
-    section.right_margin  = Inches(1.1)
+    section.top_margin    = Inches(1.0)
+    section.bottom_margin = Inches(1.0)
+    section.left_margin   = Inches(1.0)
+    section.right_margin  = Inches(1.0)
 
     # ── Base styles ──────────────────────────────────────────────────────────
     normal = doc.styles["Normal"]
     normal.font.name = "Calibri"
-    normal.font.size = Pt(11)
+    normal.font.size = Pt(10.5)
     normal.font.color.rgb = RGBColor.from_string(_INK)
     normal.paragraph_format.space_after  = Pt(6)
-    normal.paragraph_format.line_spacing = Pt(15)
+    normal.paragraph_format.line_spacing = Pt(14.5)
 
-    # ── Cover title ──────────────────────────────────────────────────────────
+    # Branded masthead bar (NO logo image, branding text only as requested)
+    brand_table = doc.add_table(rows=1, cols=1)
+    brand_table.autofit = False
+    brand_table.columns[0].width = Inches(6.5)
+    b_cell = brand_table.cell(0, 0)
+    b_cell.width = Inches(6.5)
+    _add_cell_shading(b_cell, _TEAL_DARK)
+    brand_p = b_cell.paragraphs[0]
+    brand_p.paragraph_format.space_before = Pt(6)
+    brand_p.paragraph_format.space_after  = Pt(6)
+    brand_p.paragraph_format.left_indent  = Inches(0.12)
+    _add_paragraph_run(brand_p, "AGENT OTG  |  DWE TEAM", bold=True, font_name="Calibri", size_pt=10, color_hex=_WHITE)
+
+    # ── Document Title ───────────────────────────────────────────────────────
     title_p = doc.add_paragraph()
-    title_p.paragraph_format.space_before = Pt(4)
+    title_p.paragraph_format.space_before = Pt(12)
     title_p.paragraph_format.space_after  = Pt(4)
     title_run = title_p.add_run(title)
     title_run.font.name  = "Calibri"
-    title_run.font.size  = Pt(28)
+    title_run.font.size  = Pt(26)
     title_run.font.bold  = True
     title_run.font.color.rgb = RGBColor.from_string(_TEAL_DARK)
 
-    # Teal underline rule
+    # Accent underline rule under title
     rule_p = doc.add_paragraph()
     rule_p.paragraph_format.space_before = Pt(0)
-    rule_p.paragraph_format.space_after  = Pt(10)
+    rule_p.paragraph_format.space_after  = Pt(8)
     pPr = rule_p._p.get_or_add_pPr()
     pBdr = OxmlElement("w:pBdr")
     bot = OxmlElement("w:bottom")
@@ -782,9 +1010,9 @@ def _generate_docx(title: str, content: str, path: Path) -> None:
 
     # Subtitle line
     sub_p = doc.add_paragraph()
-    sub_p.paragraph_format.space_after = Pt(18)
+    sub_p.paragraph_format.space_after = Pt(16)
     _add_paragraph_run(sub_p, f"Agent OTG  •  DWE Team  •  {_TODAY}",
-                       font_name="Calibri", size_pt=9, color_hex=_SLATE)
+                       font_name="Calibri", size_pt=9.5, color_hex=_SLATE)
 
     # ── Content: line-by-line markdown renderer ───────────────────────────────
     lines = (content or "").splitlines()
@@ -805,18 +1033,23 @@ def _generate_docx(title: str, content: str, path: Path) -> None:
                 continue
             else:
                 in_code_block = False
-                code_text = "\n".join(code_lines) if code_lines else " "
-                # Add each code line as its own paragraph with monospace bg
-                for cl in code_lines:
-                    cp = doc.add_paragraph()
+                # Code block container with left teal border
+                code_tbl = doc.add_table(rows=1, cols=1)
+                code_tbl.autofit = False
+                code_tbl.columns[0].width = Inches(6.5)
+                c_cell = code_tbl.cell(0, 0)
+                c_cell.width = Inches(6.5)
+                _add_cell_shading(c_cell, "F4F6F9")
+                _add_left_border(c_cell.paragraphs[0], _TEAL, width_pt=18)
+                for c_idx, cl in enumerate(code_lines):
+                    cp = c_cell.paragraphs[0] if c_idx == 0 else c_cell.add_paragraph()
                     cp.paragraph_format.space_before = Pt(0)
-                    cp.paragraph_format.space_after  = Pt(0)
-                    cp.paragraph_format.left_indent  = Inches(0.25)
-                    _add_shading_to_paragraph(cp, "F0F4F8")
-                    _add_paragraph_run(cp, cl or " ", font_name="Courier New", size_pt=9, color_hex="2D3748")
-                # spacing after code block
+                    cp.paragraph_format.space_after  = Pt(1.5)
+                    cp.paragraph_format.left_indent  = Inches(0.12)
+                    _add_paragraph_run(cp, cl or " ", font_name="Consolas", size_pt=9, color_hex="1E293B")
                 sp = doc.add_paragraph()
-                sp.paragraph_format.space_after = Pt(6)
+                sp.paragraph_format.space_before = Pt(2)
+                sp.paragraph_format.space_after  = Pt(4)
                 i += 1
                 continue
 
@@ -833,26 +1066,50 @@ def _generate_docx(title: str, content: str, path: Path) -> None:
                 i += 1
             parsed = _parse_markdown_table(table_lines)
             if parsed:
-                _build_docx_table(doc, parsed)
+                _build_docx_table(doc, parsed, total_width_in=6.5)
             continue
+
+        stripped_line = line.strip()
+
+        # ── Skip duplicate title if repeated at top ──────────────────────
+        if (i == 0 or (i < 3 and not stripped_line.startswith(("-", "*", ">", "|", "```")))) and stripped_line.startswith("# "):
+            if stripped_line[2:].strip().lower() == title.strip().lower():
+                i += 1
+                continue
 
         # ── Headings ─────────────────────────────────────────────────────
         if line.startswith("### "):
-            h = doc.add_heading(line[4:].strip(), level=3)
-            h.runs[0].font.color.rgb = RGBColor.from_string(_INK)
-            h.paragraph_format.space_before = Pt(10)
+            text = re.sub(r"[\*`_]", "", line[4:]).strip()
+            hp = doc.add_paragraph()
+            hp.paragraph_format.space_before = Pt(10)
+            hp.paragraph_format.space_after  = Pt(2)
+            hp.paragraph_format.keep_with_next = True
+            _add_paragraph_run(hp, text or " ", bold=True, font_name="Calibri", size_pt=11.5, color_hex=_INK)
 
         elif line.startswith("## "):
-            h = doc.add_heading(line[3:].strip(), level=2)
-            h.runs[0].font.color.rgb = RGBColor.from_string(_TEAL)
-            h.runs[0].font.size = Pt(14)
-            h.paragraph_format.space_before = Pt(14)
+            text = re.sub(r"[\*`_]", "", line[3:]).strip()
+            hp = doc.add_paragraph()
+            hp.paragraph_format.space_before = Pt(14)
+            hp.paragraph_format.space_after  = Pt(3)
+            hp.paragraph_format.keep_with_next = True
+            _add_paragraph_run(hp, text or " ", bold=True, font_name="Calibri", size_pt=13.5, color_hex=_TEAL)
 
         elif line.startswith("# "):
-            h = doc.add_heading(line[2:].strip(), level=1)
-            h.runs[0].font.color.rgb = RGBColor.from_string(_TEAL_DARK)
-            h.runs[0].font.size = Pt(18)
-            h.paragraph_format.space_before = Pt(18)
+            text = re.sub(r"[\*`_]", "", line[2:]).strip()
+            hp = doc.add_paragraph()
+            hp.paragraph_format.space_before = Pt(18)
+            hp.paragraph_format.space_after  = Pt(4)
+            hp.paragraph_format.keep_with_next = True
+            pPr_h = hp._p.get_or_add_pPr()
+            pBdr_h = OxmlElement("w:pBdr")
+            bot_h = OxmlElement("w:bottom")
+            bot_h.set(qn("w:val"), "single")
+            bot_h.set(qn("w:sz"), "6")
+            bot_h.set(qn("w:space"), "2")
+            bot_h.set(qn("w:color"), "CBD5E0")
+            pBdr_h.append(bot_h)
+            pPr_h.append(pBdr_h)
+            _add_paragraph_run(hp, text or " ", bold=True, font_name="Calibri", size_pt=16, color_hex=_TEAL_DARK)
 
         # ── Horizontal rule ───────────────────────────────────────────────
         elif line.strip() in ("---", "***", "___"):
@@ -889,35 +1146,60 @@ def _generate_docx(title: str, content: str, path: Path) -> None:
         # ── Bullet list ───────────────────────────────────────────────────
         elif re.match(r"^\s{0,4}[-*]\s", line):
             indent = len(line) - len(line.lstrip())
-            text   = re.sub(r"^\s*[-*]\s", "", line).strip()
-            style  = "List Bullet 2" if indent >= 2 else "List Bullet"
-            bp = doc.add_paragraph(style=style)
-            bp.paragraph_format.space_after = Pt(3)
+            text   = re.sub(r"^\s*[-*]\s+", "", line).strip()
+            bp = doc.add_paragraph()
+            bp.paragraph_format.left_indent  = Inches(0.4 if indent >= 2 else 0.25)
+            bp.paragraph_format.space_before = Pt(1)
+            bp.paragraph_format.space_after  = Pt(2.5)
+            bp.paragraph_format.line_spacing = Pt(14)
+            _add_paragraph_run(bp, "•  ", bold=True, font_name="Calibri", size_pt=10.5, color_hex=_TEAL)
             for frag, b, it in _inline_parse(text):
-                _add_paragraph_run(bp, frag, bold=b, italic=it, font_name="Calibri", size_pt=11)
+                _add_paragraph_run(bp, frag, bold=b, italic=it, font_name="Calibri", size_pt=10.5, color_hex=_INK)
 
         # ── Numbered list ─────────────────────────────────────────────────
-        elif re.match(r"^\d+\.\s", line):
-            text = re.sub(r"^\d+\.\s+", "", line).strip()
-            np_ = doc.add_paragraph(style="List Number")
-            np_.paragraph_format.space_after = Pt(3)
+        elif re.match(r"^\s*\d+[\.\)]\s", line):
+            m = re.match(r"^\s*(\d+)[\.\)]\s+(.*)$", line)
+            num = m.group(1) if m else "1"
+            text = m.group(2).strip() if m else line.strip()
+            np_ = doc.add_paragraph()
+            np_.paragraph_format.left_indent  = Inches(0.25)
+            np_.paragraph_format.space_before = Pt(1)
+            np_.paragraph_format.space_after  = Pt(2.5)
+            np_.paragraph_format.line_spacing = Pt(14)
+            _add_paragraph_run(np_, f"{num}.  ", bold=True, font_name="Calibri", size_pt=10.5, color_hex=_TEAL)
             for frag, b, it in _inline_parse(text):
-                _add_paragraph_run(np_, frag, bold=b, italic=it, font_name="Calibri", size_pt=11)
+                _add_paragraph_run(np_, frag, bold=b, italic=it, font_name="Calibri", size_pt=10.5, color_hex=_INK)
 
-        # ── Empty line ────────────────────────────────────────────────────
+        # ── Empty line (spacing already handled by paragraph space_after) ─
         elif not line.strip():
-            sp = doc.add_paragraph()
-            sp.paragraph_format.space_after = Pt(3)
+            pass
 
         # ── Body paragraph ────────────────────────────────────────────────
         else:
             bp = doc.add_paragraph()
-            bp.paragraph_format.space_after = Pt(7)
-            bp.paragraph_format.line_spacing = Pt(15)
+            bp.paragraph_format.space_before = Pt(0)
+            bp.paragraph_format.space_after  = Pt(6)
+            bp.paragraph_format.line_spacing = Pt(14.5)
             for frag, b, it in _inline_parse(line.strip()):
-                _add_paragraph_run(bp, frag, bold=b, italic=it, font_name="Calibri", size_pt=11)
+                _add_paragraph_run(bp, frag, bold=b, italic=it, font_name="Calibri", size_pt=10.5, color_hex=_INK)
 
         i += 1
+
+    # Flush unclosed code block if content ended inside code fence
+    if in_code_block and code_lines:
+        code_tbl = doc.add_table(rows=1, cols=1)
+        code_tbl.autofit = False
+        code_tbl.columns[0].width = Inches(6.5)
+        c_cell = code_tbl.cell(0, 0)
+        c_cell.width = Inches(6.5)
+        _add_cell_shading(c_cell, "F4F6F9")
+        _add_left_border(c_cell.paragraphs[0], _TEAL, width_pt=18)
+        for c_idx, cl in enumerate(code_lines):
+            cp = c_cell.paragraphs[0] if c_idx == 0 else c_cell.add_paragraph()
+            cp.paragraph_format.space_before = Pt(0)
+            cp.paragraph_format.space_after  = Pt(1.5)
+            cp.paragraph_format.left_indent  = Inches(0.12)
+            _add_paragraph_run(cp, cl or " ", font_name="Consolas", size_pt=9, color_hex="1E293B")
 
     # ── Footer ────────────────────────────────────────────────────────────────
     footer = section.footer.paragraphs[0]
@@ -995,6 +1277,10 @@ def _generate_pptx(title: str, content: str, path: Path) -> None:
                   0.4, 7.15, 12.5, 0.25,
                   font_name="Calibri", size=8, color=SLATE, align=PP_ALIGN.CENTER)
 
+    def _add_logo(slide, left: float, top: float, size: float = 0.30):
+        if LOGO_PATH.is_file():
+            slide.shapes.add_picture(str(LOGO_PATH), I(left), I(top), width=I(size), height=I(size))
+
     # ── SLIDE 1: Title slide ────────────────────────────────────────────────
     s0 = _blank_slide()
     _set_bg(s0, GRAY)
@@ -1007,6 +1293,7 @@ def _generate_pptx(title: str, content: str, path: Path) -> None:
     # Title text on left panel
     _add_text(s0, "AGENT OTG", 0.35, 0.4, 4.1, 0.45,
               font_name="Calibri", size=11, bold=True, color=PR(160, 212, 206))
+    _add_logo(s0, 3.85, 0.25, 0.58)
     _add_text(s0, title, 0.35, 1.0, 4.1, 3.2,
               font_name="Calibri", size=30, bold=True, color=WHITE)
     _add_text(s0, f"DWE Team  •  {_TODAY}", 0.35, 6.6, 4.1, 0.4,
@@ -1027,18 +1314,27 @@ def _generate_pptx(title: str, content: str, path: Path) -> None:
     _add_footer(s0, 1)
 
     # ── Parse content into slides ───────────────────────────────────────────
-    # Split on # headings — each # heading starts a new slide
+    # Split on markdown headings or common model forms such as
+    # "Slide 2: Deployment".  Without this normalization a valid-looking
+    # model response can become one crowded slide containing the entire deck.
     raw_lines = (content or "").splitlines()
     slides_data: list[tuple[str, list[str]]] = []
-    current_title = "Overview"
+    current_title = f"{title} — Executive Summary"
     current_body: list[str] = []
 
     for line in raw_lines:
         stripped = line.strip()
-        if stripped.startswith("# ") or stripped.startswith("## "):
+        slide_label = re.match(r"^(?:slide\s*\d+\s*[:\-–—]\s*|slide\s*\d+\s+)(.+)$", stripped, re.I)
+        if stripped.startswith("# ") or stripped.startswith("## ") or slide_label:
             if current_body or slides_data:
                 slides_data.append((current_title, current_body))
-            current_title = re.sub(r"^#+\s+", "", stripped)
+            h_raw = slide_label.group(1).strip() if slide_label else re.sub(r"^#+\s+", "", stripped)
+            h_raw = re.sub(r"[\*`_]", "", h_raw).strip()
+            if h_raw.lower() in ("introduction", "intro", "overview"):
+                h_raw = f"{title} — Executive Summary"
+            elif h_raw.lower() == title.lower():
+                h_raw = f"{title} — Overview"
+            current_title = h_raw
             current_body  = []
         else:
             if stripped:  # skip blank lines at top of slide
@@ -1050,8 +1346,34 @@ def _generate_pptx(title: str, content: str, path: Path) -> None:
     if not slides_data:
         slides_data = [(title, ["No content was generated."])]
 
+    # If a model returned only a flat bullet list, create a readable deck
+    # rather than silently rendering one giant "Overview" slide.
+    if len(slides_data) == 1 and slides_data[0][0] in ("Overview", f"{title} — Executive Summary") and len(slides_data[0][1]) > 6:
+        flat_lines = slides_data[0][1]
+        slides_data = [
+            (title if number == 0 else f"{title} — Key Points {number + 1}", flat_lines[start:start + 5])
+            for number, start in enumerate(range(0, len(flat_lines), 5))
+        ]
+
     # ── Generate content slides ─────────────────────────────────────────────
-    for slide_num, (slide_title, body_lines) in enumerate(slides_data, 2):
+    # A fixed-size slide cannot remain readable with 18 long bullets.  Split
+    # oversized sections into continuation slides so text stays on-canvas.
+    paged_slides: list[tuple[str, list[str]]] = []
+    for slide_title, body_lines in slides_data:
+        lines = body_lines or ["No content was generated."]
+        for page, start in enumerate(range(0, len(lines), 6), 1):
+            suffix = "" if page == 1 else f" (continued {page})"
+            paged_slides.append((f"{slide_title}{suffix}", lines[start:start + 6]))
+
+    fallback_slide_titles = [
+        "Executive Summary", "Context and Objectives", "Core Concepts", "Evidence and Examples",
+        "Strategic Implications", "Risks and Constraints", "Implementation Roadmap", "Recommendations",
+    ]
+    for slide_num, (slide_title, body_lines) in enumerate(paged_slides, 2):
+        # Protect direct tool calls too: a raw `Slide_1` is never a
+        # professional presentation heading.
+        if re.fullmatch(r"(?:slide[_\s-]*\d+|slide\s*title|overview)", slide_title.strip(), re.I):
+            slide_title = f"{title} — {fallback_slide_titles[(slide_num - 2) % len(fallback_slide_titles)]}"
         sl = _blank_slide()
         _set_bg(sl, GRAY)
 
@@ -1072,6 +1394,7 @@ def _generate_pptx(title: str, content: str, path: Path) -> None:
         _add_text(sl, "AGENT OTG", 11.2, 0.0, 2.0, 0.35,
                   font_name="Calibri", size=8, bold=True,
                   color=PR(160, 212, 206), align=PP_ALIGN.RIGHT)
+        _add_logo(sl, 12.72, 0.39, 0.22)
 
         # Body content area
         content_tf = slide.shapes.add_textbox(
@@ -1083,7 +1406,7 @@ def _generate_pptx(title: str, content: str, path: Path) -> None:
         body_tf.word_wrap = True
 
         first_para = True
-        for bline in body_lines[:18]:  # limit to 18 bullets per slide
+        for bline in body_lines:
             bline = bline.strip()
             if not bline:
                 continue
@@ -1144,32 +1467,59 @@ def _generate_xlsx(title: str, content: str, path: Path) -> None:
     thin = Side(style="thin", color="CBD5E0")
     thick = Side(style="medium", color=_TEAL)
 
-    for row in rows:
-        sheet.append(row)
+    # 1. Merged Title Bar on Row 1
+    col_count = max(1, len(rows[0]))
+    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=col_count)
+    title_cell = sheet.cell(1, 1, title[:110])
+    title_cell.font = Font(name="Calibri", bold=True, color=_WHITE, size=13)
+    title_cell.fill = PatternFill("solid", fgColor=_TEAL_DARK)
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+    sheet.row_dimensions[1].height = 28
+    if LOGO_PATH.is_file():
+        from openpyxl.drawing.image import Image as ExcelImage
+        logo = ExcelImage(str(LOGO_PATH))
+        logo.width = 30
+        logo.height = 30
+        sheet.add_image(logo, f"{get_column_letter(col_count)}1")
 
-    # Header row styling
-    for cell in sheet[1]:
-        cell.font = Font(name="Aptos", bold=True, color=_WHITE, size=10)
+    # 2. Header Row on Row 2
+    header_row = rows[0]
+    sheet.append(header_row)
+    for col_idx, cell in enumerate(sheet[2], 1):
+        cell.font = Font(name="Calibri", bold=True, color=_WHITE, size=11)
         cell.fill = PatternFill("solid", fgColor=_TEAL)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = Border(bottom=thick)
+        cell.border = Border(bottom=thick, left=thin, right=thin, top=thin)
+    sheet.row_dimensions[2].height = 24
 
-    # Body rows
-    for row_idx in range(2, sheet.max_row + 1):
+    # 3. Data Rows on Row 3+ with native int/float types
+    for row_idx, row_data in enumerate(rows[1:], start=3):
+        parsed_row = [_parse_cell_value(c) for c in row_data]
+        sheet.append(parsed_row)
         bg = _TEAL_LIGHT if row_idx % 2 == 0 else _WHITE
-        for cell in sheet[row_idx]:
-            cell.font = Font(name="Aptos", size=10, color=_INK)
+        for col_idx, cell in enumerate(sheet[row_idx], 1):
+            cell.font = Font(name="Calibri", size=10.5, color=_INK)
             cell.fill = PatternFill("solid", fgColor=bg)
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-            cell.border = Border(bottom=Side(style="thin", color="E2E8F0"))
+            if isinstance(cell.value, (int, float)):
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            elif isinstance(cell.value, bool):
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            cell.border = Border(bottom=thin, left=thin, right=thin, top=thin)
+        sheet.row_dimensions[row_idx].height = 20
 
-    sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = sheet.dimensions
-    sheet.row_dimensions[1].height = 22
+    sheet.freeze_panes = "A3"
+    sheet.auto_filter.ref = f"A2:{get_column_letter(sheet.max_column)}{sheet.max_row}"
 
+    # 4. Auto-fit column widths using header & data rows ONLY (rows 2 to max_row)
     for column in range(1, sheet.max_column + 1):
-        values = [str(sheet.cell(row, column).value or "") for row in range(1, sheet.max_row + 1)]
-        sheet.column_dimensions[get_column_letter(column)].width = min(max(max(map(len, values), default=10) + 3, 12), 45)
+        col_letter = get_column_letter(column)
+        max_len = 0
+        for r in range(2, sheet.max_row + 1):
+            val_str = str(sheet.cell(r, column).value or "")
+            max_len = max(max_len, len(val_str))
+        sheet.column_dimensions[col_letter].width = min(max(max_len + 4, 12), 45)
 
     workbook.save(path)
     if load_workbook(path, read_only=True).active.max_row < 1:
@@ -1189,21 +1539,36 @@ def _media_type(extension: str) -> str:
     }[extension]
 
 
+FORMAT_ALIASES = {
+    "doc": "docx", "word": "docx", "msword": "docx", "worddoc": "docx",
+    "excel": "xlsx", "spreadsheet": "xlsx", "sheet": "xlsx",
+    "ppt": "pptx", "powerpoint": "pptx", "slides": "pptx",
+    "text": "txt", "markdown": "md",
+}
+
 def create_artifact(title: str, content: str, file_format: str, filename: str | None = None) -> Artifact:
     extension = str(file_format).lower().lstrip(".")
+    extension = FORMAT_ALIASES.get(extension, extension)
     if extension not in SUPPORTED_FORMATS:
         raise ValueError(f"Unsupported format '{file_format}'. Supported: {', '.join(sorted(SUPPORTED_FORMATS))}")
 
-    # Prevent prompt strings from becoming the document title
-    t_lower = (title or "").lower().strip()
-    if any(t_lower.startswith(p) for p in ["give me", "write a", "write code", "create a", "generate a", "generate the", "/agent", "please"]) or "also generate" in t_lower:
-        clean_t, clean_c, safe_slug = derive_clean_title(title, content)
-        title = clean_t
-        content = clean_c
-        if not filename or any(filename.lower().startswith(p) for p in ["give me", "write a", "create a", "/agent"]):
-            filename = f"{safe_slug}.{extension}"
+    # Always derive clean, AI-decided document title and filename slug
+    clean_t, clean_c, safe_slug = derive_clean_title(title, content)
+    title = clean_t
+    content = clean_c
 
-    path = _safe_filename(filename or title or "output", extension)
+    # File name MUST be derived strictly from the AI-decided title
+    if not filename or any(p in filename.lower() for p in ["output", "document", "give", "write", "create", "generate", "/agent", "prompt", "test_alias"]):
+        filename = f"{safe_slug}.{extension}"
+    else:
+        # Check if caller passed a raw prompt or generic name as filename
+        f_stem = Path(filename).stem
+        if any(p in f_stem.lower() for p in ["give", "write", "create", "generate", "agent", "prompt", "output", "document"]):
+            filename = f"{safe_slug}.{extension}"
+        else:
+            filename = f"{re.sub(r'[^a-zA-Z0-9._-]+', '_', f_stem).strip('_')}.{extension}"
+
+    path = _safe_filename(filename, extension)
     if extension == "pdf":
         _generate_pdf(title, content, path)
         if len(PdfReader(str(path)).pages) < 1:
@@ -1231,6 +1596,7 @@ def create_artifact(title: str, content: str, file_format: str, filename: str | 
     if not path.is_file() or path.stat().st_size == 0:
         raise RuntimeError(f"Artifact validation failed for {path.name}")
     return Artifact(path=path, media_type=_media_type(extension), size_bytes=path.stat().st_size)
+
 
 
 def resolve_artifact(filename: str) -> Path:

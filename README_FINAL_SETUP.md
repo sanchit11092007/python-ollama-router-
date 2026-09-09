@@ -56,7 +56,6 @@ Your existing Qwen models should remain available:
 
 ```text
 qwen2.5-coder:latest
-qwen2.5:14b
 qwen2.5:7b
 qwen2.5vl:7b
 ```

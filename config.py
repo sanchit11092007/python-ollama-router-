@@ -22,10 +22,30 @@ except ImportError:
     pass
 
 # ── Model Configuration ────────────────────────────────────────────────────────
+# MAIN_MODEL and FAST_MODEL use qwen2.5:7b.
+# CODER_MODEL (qwen2.5-coder) handles ALL coding questions exclusively.
 CODER_MODEL  = os.getenv("CODER_MODEL",  "qwen2.5-coder:latest")
-MAIN_MODEL   = os.getenv("MAIN_MODEL",   "qwen2.5:14b")
+MAIN_MODEL   = os.getenv("MAIN_MODEL",   "qwen2.5:7b")
 FAST_MODEL   = os.getenv("FAST_MODEL",   "qwen2.5:7b")
 IMAGE_MODEL  = os.getenv("IMAGE_MODEL",  "qwen2.5vl:7b")
+
+# The 14B model is reserved for an explicit `/complex` terminal/API command.
+# Normal work continues through the fast 7B/coder/vision routing path.
+COMPLEX_MODEL = os.getenv("COMPLEX_MODEL", "qwen2.5:14b")
+DIRECT_14B_MODE = os.getenv("DIRECT_14B_MODE", "true").lower() == "true"
+
+# Generation limits are intentionally conservative.  They keep the local
+# process responsive and prevent a large context/history from consuming RAM.
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1536"))
+MEMORY_MAX_TURNS = int(os.getenv("MEMORY_MAX_TURNS", "6"))
+MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "12000"))
+
+# Local image generation is separate from IMAGE_MODEL (which is a vision
+# model).  This must name weights that are already available locally.
+IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL", "stabilityai/sd-turbo")
+IMAGE_GEN_LOCAL_ONLY = os.getenv("IMAGE_GEN_LOCAL_ONLY", "false").lower() == "true"
+IMAGE_GEN_SIZE = int(os.getenv("IMAGE_GEN_SIZE", "512"))
 
 # ── Ollama ─────────────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")

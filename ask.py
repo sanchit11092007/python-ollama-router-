@@ -267,7 +267,8 @@ def print_welcome_banner():
     model_table.add_column("Handles", style="dim white")
     model_table.add_row("⚡ Fast",    FAST_MODEL,    "Greetings, quick Q&A, routing decisions, RAG formatting")
     model_table.add_row("💻 Coder",   CODER_MODEL,   "Code generation, debugging, SQL, APIs, scripts")
-    model_table.add_row("🧠 Main",    MAIN_MODEL,    "Complex reasoning, essays, analysis, agent tasks")
+    model_table.add_row("🧠 Main",    MAIN_MODEL,    "General reasoning, essays, analysis, agent tasks")
+    model_table.add_row("🧠 Deep",    _cfg.COMPLEX_MODEL, "Direct answer only when prefixed with /complex")
     model_table.add_row("👁️  Vision",  IMAGE_MODEL,   "Image analysis, diagrams, screenshots, OCR")
     console.print(model_table)
 
@@ -329,11 +330,7 @@ def print_welcome_banner():
         "/image <path or URL> [question]",
         "/img <path>", IMAGE_MODEL,
     )
-    cap_table.add_row(
-        "🗂️  Multi-Task",
-        "/complex <query>",
-        "—", "Dynamic Multi-Model",
-    )
+    cap_table.add_row("🧠  Deep Direct", "/complex <query>", "/complex <query>", _cfg.COMPLEX_MODEL)
 
     console.print(cap_table)
 
@@ -394,8 +391,8 @@ def print_help_guide():
          '/image https://example.com/logo.png Describe this logo in detail.'),
         ("🛠️ Agent — Chain tasks",
          '/agent Generate a PDF about Python basics, then tell me how many pages it has.'),
-        ("🗂️ Complex Multi-part",
-         '/complex Write a marketing email AND generate SQL to find top buyers.'),
+        ("🧠 Direct 14B reasoning",
+         '/complex Compare three database designs for a high-volume financial ledger.'),
         ("🧹 Reset memory",
          'reset  — clears conversation context for a fresh start'),
         ("🗑️ List output files",
@@ -627,9 +624,10 @@ def handle_multi(query):
 def is_file_creation_request(text: str) -> bool:
     """Detects whether user prompt is asking to generate, save, or export a file/document."""
     t = text.lower()
-    has_action = bool(re.search(r"\b(generate|generatet|create|make|save|export|write|build|output|download)\b", t))
-    has_file   = bool(re.search(r"\b(pdf|docx|word doc|word document|word|excel|xlsx|csv|pptx|ppt|powerpoint|spreadsheet)\b", t))
-    return has_action and has_file
+    has_action = bool(re.search(r"\b(generate|generatet|create|make|save|export|write|build|output|download|draft|prepare|provide|deliver|give|craft|produce|convert)\b", t))
+    has_file   = bool(re.search(r"\b(pdf|docx|doc|word doc|word document|word file|word report|word|ms word|microsoft word|excel|xlsx|xls|csv|pptx|ppt|powerpoint|spreadsheet|json|text file|txt)\b", t))
+    direct_phrase = bool(re.search(r"\b(word file|doc file|docx file|pdf file|excel file|excel sheet|pptx file|save as|export to|convert to|in word|in pdf|in excel)\b", t))
+    return (has_action and has_file) or direct_phrase
 
 
 def _looks_like_mixed_file_request(text: str) -> bool:
@@ -642,6 +640,13 @@ def _looks_like_mixed_file_request(text: str) -> bool:
 
 def ask_anything(query, force_multi=False):
     """Main dispatcher for standard queries (non-agent, non-RAG)."""
+    # A configured Qwen 14B is explicitly a direct-answer model.  Do this
+    # before any automatic intent/routing work so terminal latency is one model
+    # call and the prompt receives the shared system pre-prompt only once.
+    if router.uses_direct_14b_mode(query):
+        stage("🧠 [Qwen 14B]", "Direct response mode (routing disabled).", style="bold cyan")
+        stream_with_spinner(_cfg.COMPLEX_MODEL, router.strip_complex_command(query))
+        return
     if not force_multi and _is_multi_request(query):
         handle_multi(query)
         return
@@ -1396,9 +1401,12 @@ def main():
                 handle_image(img_path, q_text)
                 continue
 
-            # ── Multi-task / Complex ───────────────────────────────────────
-            elif query.startswith("/complex "):
-                ask_anything(query[len("/complex "):].strip(), force_multi=True)
+            # ── Explicit direct Qwen 14B ───────────────────────────────────
+            elif router.is_complex_command(query):
+                if not router.strip_complex_command(query):
+                    console.print("  [dim]Usage: /complex <deep reasoning request>[/dim]\n")
+                else:
+                    ask_anything(query)
                 continue
 
             # ── Explicit /agent command ────────────────────────────────────
