@@ -374,6 +374,40 @@ def _quick_classify(query: str) -> str | None:
     return None  # Let the LLM decide
 
 
+def _split_multi_actions(query: str) -> list[str]:
+    """Split multi-action queries into self-contained sub-task strings.
+    Handles numbered items, bullet items, and sentence delimiters (period, newline, semicolon, conjunction).
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    # 1. Numbered items (e.g. 1) ... 2) ... or 1. ... 2. ...)
+    if re.search(r"(?:^|\s)(?:1[\).]|first[,:])\s+.*?(?:\s+(?:2[\).]|second[,:]))\s+", q, re.I | re.DOTALL):
+        parts = [p.strip(" ,.;") for p in re.split(r"(?:^|\s+)\d+[\).]\s+", q) if p.strip(" ,.;")]
+        if len(parts) >= 2:
+            return parts
+
+    # 2. Bulleted items (e.g. - item 1 \n - item 2)
+    if re.search(r"(?:^|\n)\s*[-*•]\s+.*?\n\s*[-*•]\s+", q):
+        parts = [p.strip(" ,.;") for p in re.split(r"(?:^|\n)\s*[-*•]\s+", q) if p.strip(" ,.;")]
+        if len(parts) >= 2:
+            return parts
+
+    # 3. Delimited by newlines, semicolons, periods followed by action/question verbs, or conjunctions
+    split_pattern = (
+        r"(?:\n+|;"
+        r"|(?<=[.!?])\s+(?=(?:also\s+)?(?:what|how|why|who|when|where|tell|show|give|write|create|generate|make|draft|explain|compare|summarize|analyze|draw)\b)"
+        r"|,\s*(?=(?:also\s+)?(?:write|create|generate|make|give|draft|explain|draw)\b)"
+        r"|\s+and\s+(?=(?:also\s+)?(?:write|create|generate|make|give|draft|explain|draw)\b))"
+    )
+    parts = [p.strip(" ,.;") for p in re.split(split_pattern, q, flags=re.I) if p.strip(" ,.;")]
+    if len(parts) >= 2:
+        return parts
+
+    return [q]
+
+
 def classify_question(query: str) -> dict:
     """
     Classify a user query into one of 5 routing categories.
@@ -403,14 +437,16 @@ def classify_question(query: str) -> dict:
     # ── Layer 0: File creation intent check — requests for document artifacts ──
     file_intent = detect_file_intent(query)
     if file_intent.get("file_format") or any(k in query.lower() for k in _FILE_CREATION_KEYWORDS):
+        multi_parts = _split_multi_actions(query)
+        is_multi = len(multi_parts) >= 2
         result_data = {
             "category":             "agent_task",
             "model":                pick_model("agent_task"),
-            "is_multi_part":        False,
+            "is_multi_part":        is_multi,
             "has_code_and_explain": False,
-            "reason":               "Explicit file creation request → routed to agent_task",
+            "reason":               "Multi-part request containing document artifact creation" if is_multi else "Explicit file creation request → routed to agent_task",
             "confidence":           1.0,
-            "routing_method":       "file_intent_check",
+            "routing_method":       "file_intent_multi" if is_multi else "file_intent_check",
         }
         _log_event("classify", {"query": query, "result": result_data})
         return result_data
@@ -867,48 +903,13 @@ Message: {query}
     except Exception:
         pass
 
-    # Small local models occasionally return invalid JSON for an obviously
-    # multi-part request.  Do not silently collapse it into one expensive task.
-    # 1. Numbered items (e.g. 1) ... 2) ... or 1. ... 2. ...)
-    if re.search(r"(?:^|\s)(?:1[\).]|first[,:])\s+.*?(?:\s+(?:2[\).]|second[,:]))\s+", query, re.I | re.DOTALL):
-        numbered_parts = [p.strip(" ,.;") for p in re.split(r"(?:^|\s+)\d+[\).]\s+", query) if p.strip(" ,.;")]
-        if len(numbered_parts) >= 2:
-            tasks = []
-            for part in numbered_parts:
-                category = _quick_classify(part) or "complex"
-                tasks.append({
-                    "label": part[:60],
-                    "task": part,
-                    "category": category,
-                    "model": pick_model(category),
-                })
-            return tasks
-
-    # 2. Bulleted items (e.g. - item 1 \n - item 2)
-    if re.search(r"(?:^|\n)\s*[-*•]\s+.*?\n\s*[-*•]\s+", query):
-        bullet_parts = [p.strip(" ,.;") for p in re.split(r"(?:^|\n)\s*[-*•]\s+", query) if p.strip(" ,.;")]
-        if len(bullet_parts) >= 2:
-            tasks = []
-            for part in bullet_parts:
-                category = _quick_classify(part) or "complex"
-                tasks.append({
-                    "label": part[:60],
-                    "task": part,
-                    "category": category,
-                    "model": pick_model(category),
-                })
-            return tasks
-
-    # 3. Delimited or conjoined action splitting
-    parts = [p.strip(" ,.;") for p in re.split(
-        r"(?:\n+|;|,\s*(?=(?:also\s+)?(?:write|create|generate|make|give|draft|explain)\b)|"
-        r"\s+and\s+(?=(?:also\s+)?(?:write|create|generate|make|give|draft|explain)\b))",
-        query, flags=re.I,
-    ) if p.strip(" ,.;")]
-    if len(parts) >= 2:
+    # Small local models occasionally return invalid JSON or single objects for an obviously
+    # multi-part request. Use deterministic action/sentence decomposition.
+    sub_parts = _split_multi_actions(query)
+    if len(sub_parts) >= 2:
         tasks = []
-        for part in parts:
-            category = _quick_classify(part) or "complex"
+        for part in sub_parts:
+            category = _quick_classify(part) or ("code" if _hard_code_check(part) else "complex")
             tasks.append({
                 "label": part[:60],
                 "task": part,

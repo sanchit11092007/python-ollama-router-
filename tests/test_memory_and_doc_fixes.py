@@ -192,3 +192,66 @@ def test_tools_write_docx_parity_with_tables_and_callouts():
     # Table should be created (masthead + data table)
     assert len(doc.tables) >= 2
     assert len(doc.inline_shapes) == 0  # No logo image
+
+
+def test_multi_agent_splits_sentences_with_periods():
+    """Verify multi-action queries separated by periods split into self-contained sub-tasks."""
+    query = "What is python. Give me an essay on harshad mehta. Give me a word file showing investment principle"
+    parts = router._split_multi_actions(query)
+    assert len(parts) == 3
+    assert "What is python" in parts[0]
+    assert "essay on harshad mehta" in parts[1].lower()
+    assert "word file" in parts[2].lower()
+
+
+def test_multi_agent_with_file_subtask_does_not_hijack_entire_query():
+    """Verify that file intent in a multi-task query flags is_multi_part: True rather than single-file hijack."""
+    query = "What is python. Give me an essay on harshad mehta. Give me a word file showing investment principle"
+    info = router.classify_question(query)
+    assert info["is_multi_part"] is True
+    assert info["category"] == "agent_task"
+
+    tasks = router.break_into_tasks(query)
+    assert len(tasks) >= 3
+
+
+def test_word_title_cleaning_conversational_lead_in():
+    """Verify that conversational intention lead-ins are stripped from Word document titles."""
+    from artifacts import _clean_topic_from_question, derive_clean_title
+    query = "I want to watch best tmkoc episodes ever. so give me the word file showing all the best episodes of tmkoc ever"
+    clean_topic = _clean_topic_from_question(query)
+    assert "Best" in clean_topic and "Episodes" in clean_topic and "TMKOC" in clean_topic.upper()
+    assert "want to watch" not in clean_topic.lower()
+    assert "so give me" not in clean_topic.lower()
+
+    title, _, slug = derive_clean_title(query, "Content about episodes")
+    assert "want to" not in title.lower()
+    assert "best_tmkoc_episodes" in slug or "episodes" in slug
+
+
+def test_langgraph_clean_subject_conversational():
+    """Verify _extract_clean_subject and _file_topic strip conversational wrappers."""
+    query = "I want to watch best tmkoc episodes ever. so give me the word file showing all the best episodes of tmkoc ever"
+    subj = langgraph_agent._extract_clean_subject(query, "docx")
+    assert "want to watch" not in subj.lower()
+    assert "so give me" not in subj.lower()
+    assert "episodes" in subj.lower()
+
+
+def test_word_inline_code_formatting():
+    """Verify inline `code` backticks format cleanly in DOCX with Consolas font."""
+    content = (
+        "## Configuration Guide\n\n"
+        "Set the variable `MAX_TURNS = 10` and call `clear_history()` to reset.\n"
+    )
+    artifact = create_artifact("Config Guide", content, "docx", "pytest_inline_code.docx")
+    doc = Document(str(artifact.path))
+    # Verify paragraphs exist and font settings applied
+    has_consolas = False
+    for p in doc.paragraphs:
+        for r in p.runs:
+            if r.font.name == "Consolas":
+                has_consolas = True
+                break
+    assert has_consolas is True
+

@@ -347,6 +347,7 @@ def print_welcome_banner():
     cmd_table.add_row("/models",  "Show active model configuration")
     cmd_table.add_row("/kb",      "Show RAG knowledge base statistics")
     cmd_table.add_row("/files",   "List all generated files in Downloads/AgentOTG/")
+    cmd_table.add_row("/multi",   "Force multi-agent task decomposition")
     cmd_table.add_row("history",  "Browse saved chat sessions")
     cmd_table.add_row("reset",    "Clear conversation memory")
     cmd_table.add_row("/cancel",  "Cancel active file attachment")
@@ -415,6 +416,8 @@ def print_help_guide():
 def _is_multi_request(query: str) -> bool:
     """True if query contains multiple distinct requests, numbered items, or mixed actions."""
     q = (query or "").strip()
+    if len(router._split_multi_actions(q)) >= 2:
+        return True
     # Check for numbered items like 1) ... 2) ... or 1. ... 2. ...
     if re.search(r"(?:^|\s)(?:1[\).]|first[,:])\s+.*?(?:\s+(?:2[\).]|second[,:]))\s+", q, re.I | re.DOTALL):
         return True
@@ -423,7 +426,7 @@ def _is_multi_request(query: str) -> bool:
         return True
     # Check for multiple action verbs with distinct objects
     actions = re.findall(r"\b(?:write|create|generate|make|draft|give|explain|summarize|compare|draw)\b", q, re.I)
-    if len(actions) >= 2 and any(sep in q.lower() for sep in [";", "\n", " and also ", ", also ", " and then ", " 2)", " 2."]):
+    if len(actions) >= 2 and (any(sep in q.lower() for sep in [";", "\n", " and also ", ", also ", " and then ", " 2)", " 2."]) or re.search(r"\.\s+(?=[A-Z])", q)):
         return True
     return _looks_like_mixed_file_request(q)
 
@@ -635,7 +638,7 @@ def _looks_like_mixed_file_request(text: str) -> bool:
     if not is_file_creation_request(text):
         return False
     actions = re.findall(r"\b(?:write|create|generate|make|draft|give|explain)\b", text, re.I)
-    return len(actions) >= 2
+    return len(actions) >= 2 or len(router._split_multi_actions(text)) >= 2
 
 
 def ask_anything(query, force_multi=False):
@@ -1416,6 +1419,16 @@ def main():
                     console.print("  [dim]Usage: /agent <instruction>  (e.g. /agent Create a PDF report on AI)[/dim]\n")
                 else:
                     handle_agent(agent_query)
+                continue
+
+            # ── Explicit /multi or /multi-agent command ────────────────────
+            elif any(query.lower().startswith(p) for p in ["/multi ", "/multi-agent ", "/multiagent "]) or query.lower() in ["/multi", "/multi-agent", "/multiagent"]:
+                prefix_len = query.find(" ")
+                rest = query[prefix_len + 1:].strip() if prefix_len != -1 else ""
+                if not rest:
+                    console.print("  [dim]Usage: /multi <multi-part instructions>[/dim]\n")
+                else:
+                    handle_multi(rest)
                 continue
 
             else:

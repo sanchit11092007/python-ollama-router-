@@ -114,6 +114,10 @@ def _non_file_question(question: str, intent: dict[str, str | None]) -> str:
 def _file_topic(question: str) -> str:
     """Extract the subject, never the instruction to create a file."""
     topic = (question or "").strip()
+    # 0. Remove conversational intention wrappers
+    topic = re.sub(r"^\s*(?:i\s+(?:want|need|would\s+like)\s+(?:to\s+)?.*?(?:[.;,]\s*|\bso\b\s+|\bthen\b\s+))", "", topic, flags=re.I)
+    topic = re.sub(r"^\s*(?:i\s+(?:want|need|would\s+like)(?:\s+to)?\s+)", "", topic, flags=re.I)
+    topic = re.sub(r"^\s*(?:so\s+)?(?:give|show|make|create|write|generate|produce|draft|prepare|provide)\s+(?:me\s+)?(?:the|a|an)?\s*", "", topic, flags=re.I)
     topic = re.sub(
         r"^\s*(?:please\s+)?(?:generate|create|make|build|export|produce|write|save|draft|prepare|provide|deliver|give|output)\s+"
         r"(?:an?\s+)?(?:pdf|word(?:\s+(?:doc(?:ument)?|file|report|format))?|docx(?:\s+(?:file|report))?|doc(?:\s+file)?|ms\s+word|microsoft\s+word|excel|xlsx|spreadsheet|excel\s+sheet|"
@@ -121,6 +125,7 @@ def _file_topic(question: str) -> str:
         r"(?:about|on|for|covering|titled|called|named|regarding|related\s+to|containing|with)?\s*",
         "", topic, flags=re.I,
     )
+    topic = re.sub(r"^\s*(?:showing|displaying|listing\s+(?:out\s+)?|containing|highlighting|explaining|describing|discussing|covering)\s+(?:all\s+(?:the\s+)?)?", "", topic, flags=re.I)
     topic = re.sub(r"^(?:the\s+)?topic\s+(?:of\s+|on\s+)?", "", topic, flags=re.I)
     topic = re.sub(
         r"(?:,?\s+(?:and\s+)?(?:also\s+)?)?(?:generate|create|make|build|export|produce|save|write|draft|prepare|provide)"
@@ -418,6 +423,11 @@ def _extract_clean_subject(question: str, file_format: str | None) -> str:
     """
     q = (question or "").strip()
 
+    # Strip conversational intention wrappers and lead-in phrases
+    q = re.sub(r"^\s*(?:i\s+(?:want|need|would\s+like)\s+(?:to\s+)?.*?(?:[.;,]\s*|\bso\b\s+|\bthen\b\s+))", "", q, flags=re.I)
+    q = re.sub(r"^\s*(?:i\s+(?:want|need|would\s+like)(?:\s+to)?\s+)", "", q, flags=re.I)
+    q = re.sub(r"^\s*(?:so\s+)?(?:give|show|make|create|write|generate|produce|draft|prepare|provide)\s+(?:me\s+)?(?:the|a|an)?\s*", "", q, flags=re.I)
+
     # Strip conversational prompt prefix
     q_cleaned = re.sub(
         r"^\s*(?:please\s+)?(?:now\s+)?(?:also\s+)?(?:can you\s+)?(?:tell me about|tell me|analyze|summarize|explain|describe|show me|give me|write about)\s+",
@@ -438,6 +448,8 @@ def _extract_clean_subject(question: str, file_format: str | None) -> str:
         r"(?:about|on|for|covering|titled|called|named|regarding|related\s+to)?\s*",
         "", q_cleaned, flags=re.I,
     ).strip()
+
+    cleaned = re.sub(r"^\s*(?:showing|displaying|listing\s+(?:out\s+)?|containing|highlighting|explaining|describing|discussing|covering)\s+(?:all\s+(?:the\s+)?)?", "", cleaned, flags=re.I)
 
     # Step 2: Strip trailing file-format request
     cleaned = re.sub(

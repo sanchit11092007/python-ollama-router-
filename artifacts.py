@@ -203,6 +203,13 @@ def _clean_topic_from_question(question: str) -> str:
         return "Generated Document"
     q = question.strip()
 
+    # 0. Remove conversational intention wrappers like:
+    # "I want to watch best tmkoc episodes ever. so give me the word file showing all the best episodes of tmkoc ever"
+    # "I need a report on solar energy. Please generate a word file"
+    q = re.sub(r"^\s*(?:i\s+(?:want|need|would\s+like)\s+(?:to\s+)?.*?(?:[.;,]\s*|\bso\b\s+|\bthen\b\s+))", "", q, flags=re.I)
+    q = re.sub(r"^\s*(?:i\s+(?:want|need|would\s+like)(?:\s+to)?\s+)", "", q, flags=re.I)
+    q = re.sub(r"^\s*(?:so\s+)?(?:give|show|make|create|write|generate|produce|draft|prepare|provide)\s+(?:me\s+)?(?:the|a|an)?\s*", "", q, flags=re.I)
+
     # 1. Remove leading conversational phrases
     q = re.sub(r"^\s*(?:please\s+)?(?:can you\s+)?(?:give me|show me|write|create|generate|make|build|export|produce|draft|prepare|provide)\s+", "", q, flags=re.I)
 
@@ -210,15 +217,18 @@ def _clean_topic_from_question(question: str) -> str:
     q = re.sub(r"^\s*(?:(?:a|an|the)\s+)?(?:pdf|docx|doc|word(?:\s+document|\s+doc|\s+file|\s+report)?|excel(?:\s+sheet|\s+file)?|xlsx|"
                r"spreadsheet|powerpoint|pptx|ppt|presentation|report|file|script|code|program|dataset|data)\s*", "", q, flags=re.I)
 
-    # 3. Remove leading prepositions ('about', 'on', 'for', 'covering', 'regarding', 'of', 'with')
-    q = re.sub(r"^\s*(?:about|on|for|covering|regarding|of|related\s+to|titled|named|called)\s+", "", q, flags=re.I)
+    # 3. 'showing', 'displaying', 'listing (out)?', 'containing', 'highlighting', 'explaining', 'describing', 'discussing', 'covering'
+    q = re.sub(r"^\s*(?:showing|displaying|listing\s+(?:out\s+)?|containing|highlighting|explaining|describing|discussing|covering)\s+(?:all\s+(?:the\s+)?)?", "", q, flags=re.I)
 
-    # 4. Remove second wave of file descriptors if chained (e.g. "report on", "dataset of", "python script for")
+    # 4. Remove leading prepositions and topic clauses ('about', 'on', 'for', 'covering', 'regarding', 'of', 'with', 'topic of/on')
+    q = re.sub(r"^\s*(?:about|on|for|covering|regarding|of|related\s+to|titled|named|called)\s+", "", q, flags=re.I)
+    q = re.sub(r"^\s*(?:the\s+)?topic\s+(?:of|on)?\s*", "", q, flags=re.I)
+
+    # 5. Remove second wave of file descriptors if chained (e.g. "report on", "dataset of", "python script for")
     q = re.sub(r"^\s*(?:(?:a|an|the)\s+)?(?:report|document|presentation|spreadsheet|dataset|file|sheet|code|script)\s+(?:about|on|for|covering|regarding|of|to)\s+", "", q, flags=re.I)
     q = re.sub(r"^\s*(?:(?:a|an|the)\s+)?(?:python|javascript|java|c\+\+|sql|bash|shell)?\s*(?:script|code|program|function|class)\s+(?:for|to|of|about)\s+", "", q, flags=re.I)
 
-
-    # 5. Remove trailing file creation clauses (e.g. "and also generate the pdf", "and put it in a word file")
+    # 6. Remove trailing file creation clauses (e.g. "and also generate the pdf", "and put it in a word file")
     q = re.sub(
         r"(?:,?\s*(?:and\s+)?(?:also\s+)?)?(?:generate|create|make|build|export|produce|save|put|write|draft|prepare|provide)"
         r"(?:\s+it)?(?:\s+as|\s+in|\s+to)?(?:\s+an?|\s+the)?\s*"
@@ -227,11 +237,12 @@ def _clean_topic_from_question(question: str) -> str:
         "", q, flags=re.I,
     )
 
-    # 6. Remove trailing constraint instructions ("with 5 key sections", "in 10 points", "with 3 bullets", "and 5 sample rows")
+    # 7. Remove trailing constraint instructions ("with 5 key sections", "in 10 points", "with 3 bullets", "and 5 sample rows")
     q = re.sub(
         r"(?:,?\s*)?(?:with|containing|including|having|in)\s+\d+\s+(?:key\s+)?(?:sections?|points?|bullets?|highlights?|rows?|columns?|pages?|sample\s+rows?).*$",
         "", q, flags=re.I,
     )
+    q = re.sub(r"(?:,?\s*)?(?:with|containing|including)\s+(?:code\s+snippets?|examples?|sample\s+data|tables?|best\s+practices?).*$", "", q, flags=re.I)
     # Remove trailing format specifications (e.g. "in docx and pdf and ppt", "as a pdf", "in word format")
     q = re.sub(
         r"(?:,?\s*)?(?:in|as|into|to)\s+(?:(?:an?|the)\s+)?(?:pdf|docx?|doc|word(?:\s+document|\s+doc|\s+file)?|excel(?:\s+sheet|\s+file)?|xlsx|spreadsheet|powerpoint|pptx?|ppt|presentation|markdown|text|json|csv)(?:\s*(?:and|,|/|\+)\s*(?:an?\s+)?(?:pdf|docx?|doc|word(?:\s+document|\s+doc|\s+file)?|excel(?:\s+sheet|\s+file)?|xlsx|spreadsheet|powerpoint|pptx?|ppt|presentation|markdown|text|json|csv))*\s*(?:format|file|document|deck)?\s*$",
@@ -239,8 +250,9 @@ def _clean_topic_from_question(question: str) -> str:
     )
     # Remove "in python", "in excel", "in word" if at the very end
     q = re.sub(r"\s+(?:in|using)\s+(?:python|excel|word|powerpoint)\s*$", "", q, flags=re.I)
+    q = re.sub(r"\s+\b(?:ever|of\s+all\s+time)\b\s*$", "", q, flags=re.I)
 
-    # 7. Strip surrounding punctuation
+    # 8. Strip surrounding punctuation
     q = q.strip(" ,.;:-_")
     q = re.sub(r"^\s*(?:about|on|for|covering|regarding|of)\s+", "", q, flags=re.I).strip(" ,.;:-_")
 
@@ -834,17 +846,22 @@ def _generate_pdf(title: str, content: str, path: Path) -> None:
 # DOCX GENERATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _add_paragraph_run(p, text: str, bold=False, italic=False,
+def _add_paragraph_run(p, text: str, bold=False, italic=False, is_code=False,
                         font_name="Calibri", size_pt=11,
                         color_hex: str | None = None) -> None:
-    """Add a formatted run to a python-docx paragraph."""
+    """Add a formatted run to a python-docx paragraph with code, bold, and italic support."""
     run = p.add_run(text)
     run.bold  = bold
     run.italic = italic
-    run.font.name = font_name
-    run.font.size = Pt(size_pt)
-    if color_hex:
-        run.font.color.rgb = RGBColor.from_string(color_hex.lstrip("#"))
+    if is_code:
+        run.font.name = "Consolas"
+        run.font.size = Pt(size_pt - 0.5)
+        run.font.color.rgb = RGBColor.from_string("1E293B")
+    else:
+        run.font.name = font_name
+        run.font.size = Pt(size_pt)
+        if color_hex:
+            run.font.color.rgb = RGBColor.from_string(color_hex.lstrip("#"))
 
 
 def _add_shading_to_paragraph(p, fill_hex: str) -> None:
@@ -917,41 +934,36 @@ def _add_left_border(p, color_hex: str, width_pt: int = 12) -> None:
     pPr.append(pBdr)
 
 
-def _inline_parse(text: str) -> list[tuple[str, bool, bool]]:
+def _inline_parse(text: str) -> list[tuple[str, bool, bool, bool]]:
     """
-    Parse **bold** and *italic* inline markdown and return a list of
-    (text_fragment, is_bold, is_italic) tuples.
+    Parse **bold**, *italic*, and `code` inline markdown and return a list of
+    (text_fragment, is_bold, is_italic, is_code) tuples.
     """
-    parts: list[tuple[str, bool, bool]] = []
+    parts: list[tuple[str, bool, bool, bool]] = []
     remaining = text
     while remaining:
-        bold_m  = re.search(r"\*\*(.+?)\*\*", remaining)
+        bold_m   = re.search(r"\*\*(.+?)\*\*", remaining)
         italic_m = re.search(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", remaining)
+        code_m   = re.search(r"`([^`]+)`", remaining)
 
-        # Pick whichever comes first
-        first = None
-        if bold_m and italic_m:
-            first = bold_m if bold_m.start() < italic_m.start() else italic_m
-        elif bold_m:
-            first = bold_m
-        elif italic_m:
-            first = italic_m
-
-        if not first:
+        matches = [m for m in [bold_m, italic_m, code_m] if m]
+        if not matches:
             if remaining:
-                parts.append((remaining, False, False))
+                parts.append((remaining, False, False, False))
             break
 
+        first = min(matches, key=lambda m: m.start())
         if first.start() > 0:
-            parts.append((remaining[:first.start()], False, False))
+            parts.append((remaining[:first.start()], False, False, False))
 
         inner = first.group(1)
-        is_bold   = first == bold_m
-        is_italic = first == italic_m
-        parts.append((inner, is_bold, is_italic))
+        is_bold   = (first == bold_m)
+        is_italic = (first == italic_m)
+        is_code   = (first == code_m)
+        parts.append((inner, is_bold, is_italic, is_code))
         remaining = remaining[first.end():]
 
-    return parts or [(text, False, False)]
+    return parts or [(text, False, False, False)]
 
 
 def _generate_docx(title: str, content: str, path: Path) -> None:
@@ -1071,9 +1083,10 @@ def _generate_docx(title: str, content: str, path: Path) -> None:
 
         stripped_line = line.strip()
 
-        # ── Skip duplicate title if repeated at top ──────────────────────
+        # ── Skip duplicate title or redundant top heading if repeated at top ──
         if (i == 0 or (i < 3 and not stripped_line.startswith(("-", "*", ">", "|", "```")))) and stripped_line.startswith("# "):
-            if stripped_line[2:].strip().lower() == title.strip().lower():
+            h_text = stripped_line[2:].strip().lower()
+            if h_text == title.strip().lower() or h_text in ("introduction", "overview", "summary", "document", "report"):
                 i += 1
                 continue
 
@@ -1139,8 +1152,8 @@ def _generate_docx(title: str, content: str, path: Path) -> None:
             cp.paragraph_format.space_after  = Pt(6)
             _add_shading_to_paragraph(cp, bg_hex)
             _add_left_border(cp, color_hex, width_pt=18)
-            for frag, b, it in _inline_parse(icon + inner):
-                _add_paragraph_run(cp, frag, bold=b, italic=it,
+            for frag, b, it, code in _inline_parse(icon + inner):
+                _add_paragraph_run(cp, frag, bold=b, italic=it, is_code=code,
                                    font_name="Calibri", size_pt=10.5, color_hex=color_hex)
 
         # ── Bullet list ───────────────────────────────────────────────────
@@ -1153,8 +1166,8 @@ def _generate_docx(title: str, content: str, path: Path) -> None:
             bp.paragraph_format.space_after  = Pt(2.5)
             bp.paragraph_format.line_spacing = Pt(14)
             _add_paragraph_run(bp, "•  ", bold=True, font_name="Calibri", size_pt=10.5, color_hex=_TEAL)
-            for frag, b, it in _inline_parse(text):
-                _add_paragraph_run(bp, frag, bold=b, italic=it, font_name="Calibri", size_pt=10.5, color_hex=_INK)
+            for frag, b, it, code in _inline_parse(text):
+                _add_paragraph_run(bp, frag, bold=b, italic=it, is_code=code, font_name="Calibri", size_pt=10.5, color_hex=_INK)
 
         # ── Numbered list ─────────────────────────────────────────────────
         elif re.match(r"^\s*\d+[\.\)]\s", line):
@@ -1167,8 +1180,8 @@ def _generate_docx(title: str, content: str, path: Path) -> None:
             np_.paragraph_format.space_after  = Pt(2.5)
             np_.paragraph_format.line_spacing = Pt(14)
             _add_paragraph_run(np_, f"{num}.  ", bold=True, font_name="Calibri", size_pt=10.5, color_hex=_TEAL)
-            for frag, b, it in _inline_parse(text):
-                _add_paragraph_run(np_, frag, bold=b, italic=it, font_name="Calibri", size_pt=10.5, color_hex=_INK)
+            for frag, b, it, code in _inline_parse(text):
+                _add_paragraph_run(np_, frag, bold=b, italic=it, is_code=code, font_name="Calibri", size_pt=10.5, color_hex=_INK)
 
         # ── Empty line (spacing already handled by paragraph space_after) ─
         elif not line.strip():
@@ -1180,8 +1193,8 @@ def _generate_docx(title: str, content: str, path: Path) -> None:
             bp.paragraph_format.space_before = Pt(0)
             bp.paragraph_format.space_after  = Pt(6)
             bp.paragraph_format.line_spacing = Pt(14.5)
-            for frag, b, it in _inline_parse(line.strip()):
-                _add_paragraph_run(bp, frag, bold=b, italic=it, font_name="Calibri", size_pt=10.5, color_hex=_INK)
+            for frag, b, it, code in _inline_parse(line.strip()):
+                _add_paragraph_run(bp, frag, bold=b, italic=it, is_code=code, font_name="Calibri", size_pt=10.5, color_hex=_INK)
 
         i += 1
 
